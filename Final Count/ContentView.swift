@@ -569,9 +569,9 @@ struct AboutView: View {
     var body: some View {
         VStack(spacing: 0) {
             VStack(spacing: 8) {
-                Image(systemName: "checkmark.seal.fill")
-                    .font(.system(size: 48))
-                    .foregroundStyle(Color.accentColor)
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .frame(width: 84, height: 84)
                 Text("Final Count")
                     .font(.title).fontWeight(.semibold)
                 Text("Version \(appVersion)")
