@@ -6,7 +6,7 @@
 
 <p align="center">
   A clean, simple macOS app for comparing folders side by side.<br/>
-  Verify that multiple drive locations or backups are truly identical — at a glance.
+  Verify that multiple drive locations or backups are truly identical. No more relying on "Get Info" for comparison.
 </p>
 
 <p align="center">
@@ -26,7 +26,7 @@
 
 Verifying that a folder copied correctly usually means selecting each subfolder, hitting **⌘ I**, and squinting at file counts and sizes one at a time. Final Count replaces that tedium: drop two (or more) folders into side-by-side columns and instantly see every subfolder's count, file count, and total size — with any mismatches highlighted automatically.
 
-It's built for photographers, editors, and anyone who keeps mirrored backups and needs a fast, no-fuss way to confirm two locations match.
+It's built for photographers, Digi-tehs, DITs, editors, and anyone who keeps mirrored backups and needs a fast, no-fuss way to confirm two locations match.
 
 ---
 
@@ -97,6 +97,9 @@ Final Count is licensed under the [GNU General Public License v3.0](https://www.
 If you find Final Count useful, consider supporting development:
 
 <p align="center">
+  <a href="https://buymeacoffee.com/fainimade">
+    <img src="https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" />
+  </a>
   <a href="https://www.paypal.com/donate/?hosted_button_id=AEY7AC82BKH5C">
     <img src="https://img.shields.io/badge/Donate-PayPal-0070BA?style=for-the-badge&logo=paypal&logoColor=white" />
   </a>
@@ -105,9 +108,6 @@ If you find Final Count useful, consider supporting development:
     <img src="https://img.shields.io/badge/Donate-Venmo-3D95CE?style=for-the-badge&logo=venmo&logoColor=white" />
   </a>
   &nbsp;
-  <a href="https://buymeacoffee.com/fainimade">
-    <img src="https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" />
-  </a>
 </p>
 
 ---
