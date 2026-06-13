@@ -12,6 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-14%2B-blue" />
   <img src="https://img.shields.io/badge/Swift-5.9-orange" />
+  <img src="https://img.shields.io/badge/license-GPL%20v3-green" />
   <img src="https://img.shields.io/badge/made%20by-FAINI%20MADE-black" />
 </p>
 
@@ -87,7 +88,7 @@ Requires macOS 14.0+ and Xcode 15+.
 
 ## License
 
-Final Count is licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/). Free for personal and non-commercial use. For commercial licensing contact [fainimade.com](https://www.fainimade.com).
+Final Count is licensed under the [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.en.html). You're free to use, study, share, and modify it — derivative works must also be released under the GPL. See the [LICENSE](LICENSE) file for the full text.
 
 ---
 
