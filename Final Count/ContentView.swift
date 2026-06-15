@@ -56,7 +56,7 @@ struct ContentView: View {
                 GeometryReader { proxy in
                     Color.clear
                         .onAppear { viewWidth = proxy.size.width }
-                        .onChange(of: proxy.size.width) { viewWidth = $0 }
+                        .onChange(of: proxy.size.width) { _, newValue in viewWidth = newValue }
                 }
             )
 
@@ -163,11 +163,13 @@ struct ResizeDivider: View {
     var body: some View {
         ZStack {
             Color.clear
-            Rectangle()
-                .fill(isHovered ? Color.accentColor.opacity(0.5) : Color(nsColor: .separatorColor))
-                .frame(width: 1)
+            Capsule()
+                .fill(isHovered ? Color.accentColor.opacity(0.7) : Color.primary.opacity(0.15))
+                .frame(width: 3, height: isHovered ? 44 : 26)
+                .animation(.easeOut(duration: 0.12), value: isHovered)
         }
         .frame(width: 8)
+        .contentShape(Rectangle())
         .onHover { isHovered = $0 }
         .gesture(
             DragGesture(minimumDistance: 1)
@@ -216,10 +218,20 @@ struct ColumnView: View {
                 totalsRow
             }
         }
+        .background(isTargeted ? Color.accentColor.opacity(0.08) : Color.primary.opacity(0.03))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(
+                    isTargeted ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.10),
+                    lineWidth: 1
+                )
+        )
+        .padding(.horizontal, 5)
+        .padding(.vertical, 8)
         .frame(width: width)
-        .background(isTargeted ? Color.accentColor.opacity(0.08) : Color.clear)
         .onDrop(of: [UTType.fileURL], isTargeted: $isTargeted, perform: handleDrop)
-        .onChange(of: column.url) { _ in
+        .onChange(of: column.url) { _, _ in
             expandedIDs.removeAll()
             childrenCache.removeAll()
         }
@@ -269,7 +281,7 @@ struct ColumnView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .frame(height: 68)
-        .background(Color.primary.opacity(0.04))
+        .background(Color.primary.opacity(0.06))
     }
 
     // MARK: Drop prompt
@@ -367,7 +379,7 @@ struct ColumnView: View {
         }
         .padding(.horizontal, 14)
         .frame(height: 68)
-        .background(Color.primary.opacity(0.04))
+        .background(Color.primary.opacity(0.06))
     }
 
     // MARK: Helpers
@@ -627,6 +639,22 @@ struct AboutView: View {
             Divider()
 
             VStack(spacing: 10) {
+                Link(destination: URL(string: "https://buymeacoffee.com/fainimade")!) {
+                    HStack(spacing: 7) {
+                        Image(systemName: "cup.and.saucer.fill")
+                        Text("Buy Me a Coffee")
+                    }
+                    .font(.callout).fontWeight(.semibold)
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 9)
+                    .background(
+                        Capsule().fill(Color(red: 1.0, green: 0.86, blue: 0.0))
+                    )
+                }
+                .buttonStyle(.plain)
+                .help("Support development on Buy Me a Coffee")
+
                 HStack(spacing: 16) {
                     Link(destination: Self.repoURL) {
                         Label("View on GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
@@ -634,13 +662,6 @@ struct AboutView: View {
                     Link(destination: URL(string: "https://www.fainimade.com")!) {
                         Label("fainimade.com", systemImage: "globe")
                     }
-                }
-                .font(.footnote)
-
-                HStack(spacing: 4) {
-                    Text("Made by").foregroundStyle(.secondary)
-                    Link("Faini Made", destination: URL(string: "https://www.fainimade.com")!)
-                        .foregroundStyle(Color.accentColor)
                 }
                 .font(.footnote)
             }

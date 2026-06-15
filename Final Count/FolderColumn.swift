@@ -164,7 +164,9 @@ enum MatchStatus { case match, mismatch, missing }
 // MARK: - Export
 
 private func rpad(_ s: String, _ w: Int) -> String {
-    s.count >= w ? s : s + String(repeating: " ", count: w - s.count)
+    if s.count == w { return s }
+    if s.count > w { return String(s.prefix(max(0, w - 1))) + "…" }
+    return s + String(repeating: " ", count: w - s.count)
 }
 private func lpad(_ s: String, _ w: Int) -> String {
     s.count >= w ? s : String(repeating: " ", count: w - s.count) + s
