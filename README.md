@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img src="Screenshot_FinalCount.jpg" alt="Final Count screenshot" width="640" />
+  <img src="FinalCount_Screenshot.jpg" alt="Final Count screenshot" width="640" />
 </p>
 
 ---
