@@ -341,7 +341,10 @@ struct ColumnView: View {
                         info: sub,
                         depth: 0,
                         status: statusFor(name: sub.name, in: allColumns),
-                        showStatus: allColumns.count > 1 && allColumns.allSatisfy({ $0.url != nil }),
+                        statusDetail: statusDetail(name: sub.name, in: allColumns),
+                        // Comparing against a column that is still scanning (url set,
+                        // subfolders not yet populated) would flag every row as missing.
+                        showStatus: allColumns.count > 1 && allColumns.allSatisfy({ $0.url != nil && !$0.isLoading }),
                         subW: subW, fileW: fileW, sizeW: sizeW,
                         expandedIDs: $expandedIDs,
                         childrenCache: $childrenCache
@@ -417,6 +420,7 @@ struct ExpandableSubfolderRow: View {
     let info: SubfolderInfo?
     let depth: Int
     let status: MatchStatus
+    var statusDetail: String? = nil
     let showStatus: Bool
     let subW: CGFloat
     let fileW: CGFloat
@@ -493,10 +497,12 @@ struct ExpandableSubfolderRow: View {
                             Image(systemName: "exclamationmark.circle.fill")
                                 .font(.caption2).foregroundStyle(.orange)
                                 .frame(width: 20)
+                                .help(statusDetail ?? "Contents differ between columns")
                         case .missing:
                             Image(systemName: "minus.circle.fill")
                                 .font(.caption2).foregroundStyle(.red)
                                 .frame(width: 20)
+                                .help(statusDetail ?? "Folder not found in every column")
                         }
                     } else {
                         Spacer().frame(width: 20)
@@ -628,7 +634,7 @@ struct AboutView: View {
                         BulletRow("Add more columns with the + button on the right.")
                         BulletRow("Click the chevron next to a subfolder to expand and inspect its contents.")
                         BulletRow("Drag the divider between columns to resize them.")
-                        BulletRow("Mismatched subfolders are flagged in orange; folders missing from a column appear in red.")
+                        BulletRow("Mismatched subfolders are flagged in orange; folders missing from a column appear in red. Hover the icon for exact file and byte counts — displayed sizes are rounded, so folders can look identical while differing by a few bytes.")
                         BulletRow("Click a folder's path to change it, or right-click to reveal it in Finder.")
                         BulletRow("Export a plain-text report with the Export button when you're done.")
                     }

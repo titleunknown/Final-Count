@@ -149,16 +149,49 @@ class FolderColumn: ObservableObject, Identifiable {
 
 enum MatchStatus { case match, mismatch, missing }
 
+/// Folder names that look identical can differ invisibly (trailing spaces, case,
+/// width/diacritic variants) across volumes and copy tools; treat those as the same folder.
+func canonicalFolderName(_ s: String) -> String {
+    s.trimmingCharacters(in: .whitespacesAndNewlines)
+        .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+}
+
 @MainActor func statusFor(name: String, in columns: [FolderColumn]) -> MatchStatus {
-    let entries = columns.compactMap { $0.subfolders.first(where: { $0.name == name }) }
+    let key = canonicalFolderName(name)
+    let entries = columns.compactMap { $0.subfolders.first(where: { canonicalFolderName($0.name) == key }) }
     guard entries.count == columns.count else { return .missing }
     let first = entries[0]
     return entries.dropFirst().allSatisfy({ $0.fileCount == first.fileCount && $0.byteSize == first.byteSize })
         ? .match : .mismatch
 }
 
+/// Explains a non-matching row with exact numbers, since the displayed sizes are
+/// rounded and can look identical while the byte counts differ. Returns nil for matches.
+@MainActor func statusDetail(name: String, in columns: [FolderColumn]) -> String? {
+    let key = canonicalFolderName(name)
+    let entries = columns.map { col in
+        col.subfolders.first(where: { canonicalFolderName($0.name) == key })
+    }
+    let missingFrom = zip(columns, entries).filter { $0.1 == nil }.map { $0.0.path }
+    if !missingFrom.isEmpty {
+        return "Not found in:\n" + missingFrom.joined(separator: "\n")
+    }
+    let found = entries.compactMap { $0 }
+    guard let first = found.first,
+          found.dropFirst().contains(where: { $0.fileCount != first.fileCount || $0.byteSize != first.byteSize })
+    else { return nil }
+    return zip(columns, found).map { col, e in
+        "\(col.path): \(e.fileCount.formatted()) files, \(e.byteSize.formatted()) bytes"
+    }.joined(separator: "\n")
+}
+
 @MainActor func allSubfolderNames(in columns: [FolderColumn]) -> [String] {
-    Array(Set(columns.flatMap { $0.subfolders.map(\.name) })).sorted()
+    var seenKeys = Set<String>()
+    var names: [String] = []
+    for name in columns.flatMap({ $0.subfolders.map(\.name) }) {
+        if seenKeys.insert(canonicalFolderName(name)).inserted { names.append(name) }
+    }
+    return names.sorted()
 }
 
 // MARK: - Export
