@@ -212,6 +212,8 @@ struct ColumnView: View {
                 Spacer()
             } else if column.url == nil {
                 dropPrompt
+            } else if let error = column.loadError {
+                accessErrorPrompt(error)
             } else {
                 subfolderList
                 Divider()
@@ -304,6 +306,28 @@ struct ColumnView: View {
         .contentShape(Rectangle())
     }
 
+    // MARK: Access error
+
+    private func accessErrorPrompt(_ message: String) -> some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "lock.trianglebadge.exclamationmark")
+                .font(.largeTitle)
+                .foregroundStyle(.orange)
+            Text(message)
+                .multilineTextAlignment(.center)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Browse…", action: chooseDifferentFolder)
+                .buttonStyle(.bordered)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 20)
+        .contentShape(Rectangle())
+    }
+
     // MARK: Subfolder list
 
     private var subfolderList: some View {
@@ -359,8 +383,9 @@ struct ColumnView: View {
 
     private var totalsRow: some View {
         let totalSubdirs = column.subfolders.reduce(0) { $0 + $1.subfolderCount }
+        let folderCount = column.subfolders.filter { !$0.isLooseFilesRow }.count
         return VStack(alignment: .leading, spacing: 3) {
-            Text("\(column.subfolders.count) subfolder\(column.subfolders.count == 1 ? "" : "s")")
+            Text("\(folderCount) subfolder\(folderCount == 1 ? "" : "s")")
                 .font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 0) {
                 Text("Total")
@@ -527,6 +552,7 @@ struct ExpandableSubfolderRow: View {
             // Name
             Text(name)
                 .font(.callout)
+                .italic(info?.isLooseFilesRow == true)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .foregroundStyle(info == nil ? Color.secondary : Color.primary)
