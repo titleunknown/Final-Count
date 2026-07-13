@@ -40,11 +40,17 @@ struct SubfolderInfo: Identifiable {
     let fileCount: Int
     let byteSize: Int64
     let subfolderCount: Int  // immediate subdirectories only
+    // Synthetic row aggregating files that sit directly in the folder rather than
+    // in a subfolder — without it, a folder of loose files renders as empty.
+    var isLooseFilesRow: Bool = false
 
     var formattedSize: String { ByteCountFormatter.string(fromByteCount: byteSize, countStyle: .file) }
     var formattedCount: String { fileCount.formatted() }
     var formattedSubfolderCount: String { subfolderCount > 0 ? subfolderCount.formatted() : "—" }
 }
+
+// Shared so the row compares by name across columns like any real subfolder.
+let looseFilesRowName = "Files (not in a subfolder)"
 
 @MainActor
 class FolderColumn: ObservableObject, Identifiable {
@@ -55,6 +61,9 @@ class FolderColumn: ObservableObject, Identifiable {
     @Published var isLoading = false
     @Published var totalFiles: Int = 0
     @Published var totalBytes: Int64 = 0
+    // Non-nil when the top-level folder couldn't be read (e.g. macOS denied access),
+    // so the UI can distinguish an access failure from a genuinely empty folder.
+    @Published var loadError: String?
 
     var name: String { url?.lastPathComponent ?? "" }
     var path: String { url?.path ?? "" }
@@ -64,6 +73,7 @@ class FolderColumn: ObservableObject, Identifiable {
         subfolders = []
         totalFiles = 0
         totalBytes = 0
+        loadError = nil
         isLoading = true
 
         Task {
@@ -73,6 +83,7 @@ class FolderColumn: ObservableObject, Identifiable {
             self.subfolders = result.subfolders
             self.totalFiles = result.totalFiles
             self.totalBytes = result.totalBytes
+            self.loadError = result.error
             self.isLoading = false
         }
     }
@@ -87,34 +98,72 @@ class FolderColumn: ObservableObject, Identifiable {
         analyzeDirectory(url: url).subfolders
     }
 
-    private nonisolated static func analyzeDirectory(url: URL) -> (subfolders: [SubfolderInfo], totalFiles: Int, totalBytes: Int64) {
+    private nonisolated static func analyzeDirectory(url: URL) -> (subfolders: [SubfolderInfo], totalFiles: Int, totalBytes: Int64, error: String?) {
         let fm = FileManager.default
-        guard let contents = try? fm.contentsOfDirectory(
-            at: url,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return ([], 0, 0) }
+        let contents: [URL]
+        do {
+            contents = try fm.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey],
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            return ([], 0, 0, describeAccessError(error))
+        }
 
         var infos: [SubfolderInfo] = []
         var grandTotalFiles = 0
         var grandTotalBytes: Int64 = 0
+        var looseFiles = 0
+        var looseBytes: Int64 = 0
 
         for item in contents.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-            guard (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
-            let (fileCount, bytes) = deepCount(at: item, fm: fm)
-            let subfolderCount = immediateSubdirCount(at: item, fm: fm)
-            infos.append(SubfolderInfo(
-                name: item.lastPathComponent,
-                url: item,
-                fileCount: fileCount,
-                byteSize: bytes,
-                subfolderCount: subfolderCount
-            ))
-            grandTotalFiles += fileCount
-            grandTotalBytes += bytes
+            let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey])
+            if values?.isDirectory == true {
+                let (fileCount, bytes) = deepCount(at: item, fm: fm)
+                let subfolderCount = immediateSubdirCount(at: item, fm: fm)
+                infos.append(SubfolderInfo(
+                    name: item.lastPathComponent,
+                    url: item,
+                    fileCount: fileCount,
+                    byteSize: bytes,
+                    subfolderCount: subfolderCount
+                ))
+                grandTotalFiles += fileCount
+                grandTotalBytes += bytes
+            } else if values?.isRegularFile == true {
+                looseFiles += 1
+                looseBytes += Int64(values?.fileSize ?? 0)
+            }
         }
 
-        return (infos, grandTotalFiles, grandTotalBytes)
+        if looseFiles > 0 {
+            infos.insert(SubfolderInfo(
+                name: looseFilesRowName,
+                url: url,
+                fileCount: looseFiles,
+                byteSize: looseBytes,
+                subfolderCount: 0,
+                isLooseFilesRow: true
+            ), at: 0)
+            grandTotalFiles += looseFiles
+            grandTotalBytes += looseBytes
+        }
+
+        return (infos, grandTotalFiles, grandTotalBytes, nil)
+    }
+
+    /// Turns a directory-read failure into a message aimed at the likely cause: a
+    /// sandboxed app losing access to a dropped folder. Browse re-grants that access.
+    private nonisolated static func describeAccessError(_ error: Error) -> String {
+        let nsError = error as NSError
+        let isPermission = nsError.domain == NSCocoaErrorDomain
+            && [NSFileReadNoPermissionError, NSFileReadUnknownError].contains(nsError.code)
+            || (nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(EPERM))
+        if isPermission {
+            return "macOS denied access to this folder. Click the path above and re-select it with Browse… to grant access."
+        }
+        return "Couldn't read this folder: \(nsError.localizedDescription)"
     }
 
     private nonisolated static func deepCount(at url: URL, fm: FileManager) -> (Int, Int64) {
@@ -222,7 +271,7 @@ private func lpad(_ s: String, _ w: Int) -> String {
             lines.append("  " + rpad(sub.name, 32) + " " + lpad(sub.formattedSubfolderCount, 8) + "  " + lpad(sub.formattedCount, 8) + "  " + lpad(sub.formattedSize, 12))
         }
         lines.append("    " + String(repeating: "─", count: 68))
-        let totalLabel = "TOTAL (\(col.subfolders.count) folders)"
+        let totalLabel = "TOTAL (\(col.subfolders.filter { !$0.isLooseFilesRow }.count) folders)"
         let totalSize = ByteCountFormatter.string(fromByteCount: col.totalBytes, countStyle: .file)
         lines.append("  " + rpad(totalLabel, 32) + " " + lpad("—", 8) + "  " + lpad(col.totalFiles.formatted(), 8) + "  " + lpad(totalSize, 12))
     }

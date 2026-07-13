@@ -30,6 +30,49 @@ struct ContentView: View {
         return max(minColWidth, available / max(1, CGFloat(columns.count)))
     }
 
+    /// Overall verdict shown in the status bar. `.notReady` while there's fewer
+    /// than two folders, or any is still scanning or failed to load — comparing
+    /// then would be meaningless or would falsely flag everything.
+    private enum OverallStatus: Equatable {
+        case notReady
+        case identical
+        case differences(Int)
+    }
+
+    private var overallStatus: OverallStatus {
+        let ready = columns.count > 1
+            && columns.allSatisfy { $0.url != nil && !$0.isLoading && $0.loadError == nil }
+        guard ready else { return .notReady }
+        let mismatchCount = allSubfolderNames(in: columns)
+            .filter { statusFor(name: $0, in: columns) != .match }
+            .count
+        return mismatchCount == 0 ? .identical : .differences(mismatchCount)
+    }
+
+    @ViewBuilder
+    private var statusBanner: some View {
+        switch overallStatus {
+        case .notReady:
+            EmptyView()
+        case .identical:
+            StatusBanner(
+                icon: "checkmark.seal.fill",
+                tint: .green,
+                title: "All folders are identical",
+                subtitle: "Every subfolder matches on file count and size."
+            )
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        case .differences(let n):
+            StatusBanner(
+                icon: "exclamationmark.triangle.fill",
+                tint: .red,
+                title: "\(n) difference\(n == 1 ? "" : "s") found",
+                subtitle: "Highlighted subfolders differ or are missing."
+            )
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             ScrollView(.horizontal, showsIndicators: true) {
@@ -59,6 +102,14 @@ struct ContentView: View {
                         .onChange(of: proxy.size.width) { _, newValue in viewWidth = newValue }
                 }
             )
+            // This ScrollView is the ONE flexible region: it soaks up all vertical
+            // slack and yields to whatever fixed chrome sits below it (the status
+            // banner and toolbar). Without this, the ScrollView reports a firm ideal
+            // height and any chrome added beneath it overflows the window, clipping
+            // the toolbar. Keep this here — it's what lets new chrome coexist safely.
+            .frame(maxHeight: .infinity)
+
+            statusBanner
 
             Divider()
             HStack {
@@ -85,7 +136,10 @@ struct ContentView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
         }
-        .frame(minWidth: 920, minHeight: 620)
+        // minHeight leaves room for the columns (~560) plus the fixed chrome below
+        // them (status banner + toolbar) so nothing is clipped at the smallest size.
+        .frame(minWidth: 920, minHeight: 700)
+        .animation(.easeInOut(duration: 0.2), value: overallStatus)
         .sheet(isPresented: $showAbout) { AboutView() }
         .task {
             store.setInitial(count: 2)
@@ -153,6 +207,38 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Status Banner
+
+/// The big at-a-glance verdict bar above the toolbar — readable across the room
+/// so you can confirm a backup matches without leaning into the numbers.
+struct StatusBanner: View {
+    let icon: String
+    let tint: Color
+    let title: String
+    let subtitle: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(tint)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(tint)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.14))
+    }
+}
+
 // MARK: - Resize Divider
 
 struct ResizeDivider: View {
@@ -212,6 +298,8 @@ struct ColumnView: View {
                 Spacer()
             } else if column.url == nil {
                 dropPrompt
+            } else if let error = column.loadError {
+                accessErrorPrompt(error)
             } else {
                 subfolderList
                 Divider()
@@ -304,6 +392,28 @@ struct ColumnView: View {
         .contentShape(Rectangle())
     }
 
+    // MARK: Access error
+
+    private func accessErrorPrompt(_ message: String) -> some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "lock.trianglebadge.exclamationmark")
+                .font(.largeTitle)
+                .foregroundStyle(.orange)
+            Text(message)
+                .multilineTextAlignment(.center)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Browse…", action: chooseDifferentFolder)
+                .buttonStyle(.bordered)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 20)
+        .contentShape(Rectangle())
+    }
+
     // MARK: Subfolder list
 
     private var subfolderList: some View {
@@ -359,8 +469,9 @@ struct ColumnView: View {
 
     private var totalsRow: some View {
         let totalSubdirs = column.subfolders.reduce(0) { $0 + $1.subfolderCount }
+        let folderCount = column.subfolders.filter { !$0.isLooseFilesRow }.count
         return VStack(alignment: .leading, spacing: 3) {
-            Text("\(column.subfolders.count) subfolder\(column.subfolders.count == 1 ? "" : "s")")
+            Text("\(folderCount) subfolder\(folderCount == 1 ? "" : "s")")
                 .font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 0) {
                 Text("Total")
@@ -527,6 +638,7 @@ struct ExpandableSubfolderRow: View {
             // Name
             Text(name)
                 .font(.callout)
+                .italic(info?.isLooseFilesRow == true)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .foregroundStyle(info == nil ? Color.secondary : Color.primary)
@@ -665,7 +777,7 @@ struct AboutView: View {
                     Link(destination: Self.repoURL) {
                         Label("View on GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
                     }
-                    Link(destination: URL(string: "https://www.fainimade.com")!) {
+                    Link(destination: URL(string: "https://www.fainimade.com/software")!) {
                         Label("fainimade.com", systemImage: "globe")
                     }
                 }
