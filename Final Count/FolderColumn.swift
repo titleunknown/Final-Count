@@ -33,6 +33,16 @@ class FolderStore: ObservableObject {
     }
 }
 
+struct FileTypeCount: Identifiable {
+    let id = UUID()
+    let ext: String
+    let count: Int
+    let bytes: Int64
+
+    var formattedSize: String { ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) }
+    var formattedCount: String { count.formatted() }
+}
+
 struct SubfolderInfo: Identifiable {
     let id = UUID()
     let name: String
@@ -43,6 +53,9 @@ struct SubfolderInfo: Identifiable {
     // Synthetic row aggregating files that sit directly in the folder rather than
     // in a subfolder — without it, a folder of loose files renders as empty.
     var isLooseFilesRow: Bool = false
+    // Breakdown by extension, populated only for loose-files rows (not recursed
+    // into subfolder totals), sorted by count descending.
+    var typeCounts: [FileTypeCount] = []
 
     var formattedSize: String { ByteCountFormatter.string(fromByteCount: byteSize, countStyle: .file) }
     var formattedCount: String { fileCount.formatted() }
@@ -116,6 +129,7 @@ class FolderColumn: ObservableObject, Identifiable {
         var grandTotalBytes: Int64 = 0
         var looseFiles = 0
         var looseBytes: Int64 = 0
+        var looseTypeCounts: [String: (count: Int, bytes: Int64)] = [:]
 
         for item in contents.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey])
@@ -133,18 +147,26 @@ class FolderColumn: ObservableObject, Identifiable {
                 grandTotalBytes += bytes
             } else if values?.isRegularFile == true {
                 looseFiles += 1
-                looseBytes += Int64(values?.fileSize ?? 0)
+                let size = Int64(values?.fileSize ?? 0)
+                looseBytes += size
+                let ext = item.pathExtension.isEmpty ? "No extension" : item.pathExtension.uppercased()
+                looseTypeCounts[ext, default: (0, 0)].count += 1
+                looseTypeCounts[ext, default: (0, 0)].bytes += size
             }
         }
 
         if looseFiles > 0 {
+            let typeCounts = looseTypeCounts
+                .map { FileTypeCount(ext: $0.key, count: $0.value.count, bytes: $0.value.bytes) }
+                .sorted { $0.count != $1.count ? $0.count > $1.count : $0.ext < $1.ext }
             infos.insert(SubfolderInfo(
                 name: looseFilesRowName,
                 url: url,
                 fileCount: looseFiles,
                 byteSize: looseBytes,
                 subfolderCount: 0,
-                isLooseFilesRow: true
+                isLooseFilesRow: true,
+                typeCounts: typeCounts
             ), at: 0)
             grandTotalFiles += looseFiles
             grandTotalBytes += looseBytes

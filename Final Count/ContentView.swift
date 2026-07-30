@@ -15,6 +15,7 @@ struct ContentView: View {
     @State private var viewWidth: CGFloat = 900
     @State private var showExportSuccess = false
     @State private var showAbout = false
+    @State private var showFileTypeCounts = false
 
     private var columns: [FolderColumn] { store.columns }
 
@@ -82,6 +83,7 @@ struct ContentView: View {
                             column: col,
                             allColumns: columns,
                             width: columnWidth(for: col),
+                            showFileTypeCounts: showFileTypeCounts,
                             onRemove: { remove(col) }
                         )
                         ResizeDivider { delta in
@@ -118,6 +120,11 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .help("Re-scan all folders")
+
+                Toggle("File Type Counts", isOn: $showFileTypeCounts)
+                    .toggleStyle(.checkbox)
+                    .help("Show a breakdown by file extension for loose files")
+                    .padding(.leading, 12)
 
                 Spacer()
 
@@ -276,11 +283,13 @@ struct ColumnView: View {
     @ObservedObject var column: FolderColumn
     let allColumns: [FolderColumn]
     let width: CGFloat
+    let showFileTypeCounts: Bool
     let onRemove: () -> Void
 
     @State private var isTargeted = false
     @State private var expandedIDs: Set<UUID> = []
     @State private var childrenCache: [UUID: [SubfolderInfo]] = [:]
+    @State private var expandedTypeIDs: Set<UUID> = []
 
     // Fixed widths for numeric columns
     private let subW: CGFloat = 60
@@ -322,6 +331,7 @@ struct ColumnView: View {
         .onChange(of: column.url) { _, _ in
             expandedIDs.removeAll()
             childrenCache.removeAll()
+            expandedTypeIDs.removeAll()
         }
     }
 
@@ -457,7 +467,9 @@ struct ColumnView: View {
                         showStatus: allColumns.count > 1 && allColumns.allSatisfy({ $0.url != nil && !$0.isLoading }),
                         subW: subW, fileW: fileW, sizeW: sizeW,
                         expandedIDs: $expandedIDs,
-                        childrenCache: $childrenCache
+                        childrenCache: $childrenCache,
+                        showFileTypeCounts: showFileTypeCounts,
+                        expandedTypeIDs: $expandedTypeIDs
                     )
                     Divider().padding(.leading, 14)
                 }
@@ -538,13 +550,39 @@ struct ExpandableSubfolderRow: View {
     let sizeW: CGFloat
     @Binding var expandedIDs: Set<UUID>
     @Binding var childrenCache: [UUID: [SubfolderInfo]]
+    var showFileTypeCounts: Bool = false
+    @Binding var expandedTypeIDs: Set<UUID>
 
     private var isExpanded: Bool { info.map { expandedIDs.contains($0.id) } ?? false }
     private var canExpand: Bool { (info?.subfolderCount ?? 0) > 0 }
+    private var canShowTypeCounts: Bool {
+        showFileTypeCounts && info?.isLooseFilesRow == true && !(info?.typeCounts.isEmpty ?? true)
+    }
+    private var typeCountsExpanded: Bool { info.map { expandedTypeIDs.contains($0.id) } ?? false }
+    // When the toggle is off, the click-to-expand rows aren't available — offer the
+    // same breakdown as a hover tooltip instead so it's never entirely hidden.
+    private var hoverTypeCountsTooltip: String? {
+        guard !showFileTypeCounts, info?.isLooseFilesRow == true,
+              let counts = info?.typeCounts, !counts.isEmpty else { return nil }
+        return counts
+            .map { "\($0.ext): \($0.formattedCount) (\($0.formattedSize))" }
+            .joined(separator: "\n")
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            rowContent
+            Group {
+                if let hoverTypeCountsTooltip {
+                    rowContent.help(hoverTypeCountsTooltip)
+                } else {
+                    rowContent
+                }
+            }
+            if canShowTypeCounts && typeCountsExpanded, let info {
+                ForEach(info.typeCounts) { tc in
+                    TypeCountRow(typeCount: tc, depth: depth, subW: subW, fileW: fileW, sizeW: sizeW)
+                }
+            }
             if isExpanded, let info {
                 if let children = childrenCache[info.id] {
                     ForEach(children) { child in
@@ -556,7 +594,9 @@ struct ExpandableSubfolderRow: View {
                             showStatus: false,
                             subW: subW, fileW: fileW, sizeW: sizeW,
                             expandedIDs: $expandedIDs,
-                            childrenCache: $childrenCache
+                            childrenCache: $childrenCache,
+                            showFileTypeCounts: showFileTypeCounts,
+                            expandedTypeIDs: $expandedTypeIDs
                         )
                         Divider().padding(.leading, indentWidth + 14)
                     }
@@ -653,10 +693,24 @@ struct ExpandableSubfolderRow: View {
                     .foregroundStyle(.secondary)
                     .frame(width: subW, alignment: .trailing)
                 // Files
-                Text(info.formattedCount)
-                    .font(.callout).monospacedDigit()
-                    .foregroundStyle(showStatus && status == .mismatch ? Color.orange : Color.primary)
-                    .frame(width: fileW, alignment: .trailing)
+                Group {
+                    if canShowTypeCounts {
+                        Button(action: toggleTypeCounts) {
+                            HStack(spacing: 2) {
+                                Text(info.formattedCount)
+                                Image(systemName: typeCountsExpanded ? "chevron.up" : "chevron.down")
+                                    .font(.caption2)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help("Click to \(typeCountsExpanded ? "hide" : "show") the breakdown by file type")
+                    } else {
+                        Text(info.formattedCount)
+                    }
+                }
+                .font(.callout).monospacedDigit()
+                .foregroundStyle(showStatus && status == .mismatch ? Color.orange : Color.primary)
+                .frame(width: fileW, alignment: .trailing)
                 // Size
                 Text(info.formattedSize)
                     .font(.callout).monospacedDigit()
@@ -681,6 +735,58 @@ struct ExpandableSubfolderRow: View {
         } else {
             expandedIDs.insert(info.id)
         }
+    }
+
+    private func toggleTypeCounts() {
+        guard let info else { return }
+        if typeCountsExpanded {
+            expandedTypeIDs.remove(info.id)
+        } else {
+            expandedTypeIDs.insert(info.id)
+        }
+    }
+}
+
+// MARK: - File Type Count Row
+
+/// Sub-row rendered under a loose-files row when its extension breakdown is expanded.
+private struct TypeCountRow: View {
+    let typeCount: FileTypeCount
+    let depth: Int
+    let subW: CGFloat
+    let fileW: CGFloat
+    let sizeW: CGFloat
+
+    private var indentWidth: CGFloat { CGFloat(depth) * 18 }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if depth > 0 {
+                Spacer().frame(width: indentWidth)
+            }
+            Spacer().frame(width: 20 + 16)
+
+            Text("↳ \(typeCount.ext)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .padding(.leading, 4)
+
+            Spacer(minLength: 6)
+
+            Spacer().frame(width: subW)
+            Text(typeCount.formattedCount)
+                .font(.caption).monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: fileW, alignment: .trailing)
+            Text(typeCount.formattedSize)
+                .font(.caption).monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: sizeW, alignment: .trailing)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 4)
     }
 }
 
