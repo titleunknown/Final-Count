@@ -908,10 +908,10 @@ struct AboutView: View {
                 .font(.caption).foregroundStyle(.green)
         case .available(let version, let url):
             Link(destination: url) {
-                Label("Version \(version) available — download", systemImage: "arrow.down.circle.fill")
-                    .font(.caption).fontWeight(.medium)
+                Label("Download Version \(version)", systemImage: "arrow.down.circle.fill")
             }
-            .foregroundStyle(Color.accentColor)
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
         case .failed(let message):
             Label(message, systemImage: "exclamationmark.triangle.fill")
                 .font(.caption).foregroundStyle(.orange)
