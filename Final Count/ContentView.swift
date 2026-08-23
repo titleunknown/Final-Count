@@ -16,6 +16,12 @@ struct ContentView: View {
     @State private var showExportSuccess = false
     @State private var showAbout = false
     @State private var showFileTypeCounts = false
+    // Expansion and scanned children live here, not in each ColumnView, so every
+    // column expands in lockstep and a nested folder can be compared across
+    // columns the same way top-level rows are. Keyed by path relative to the
+    // column root, so the key is stable across columns and across a re-scan.
+    @State private var expandedRelPaths: Set<String> = []
+    @State private var childCache: [ChildCacheKey: [SubfolderInfo]] = [:]
 
     private var columns: [FolderColumn] { store.columns }
 
@@ -84,6 +90,8 @@ struct ContentView: View {
                             allColumns: columns,
                             width: columnWidth(for: col),
                             showFileTypeCounts: showFileTypeCounts,
+                            expandedRelPaths: $expandedRelPaths,
+                            childCache: $childCache,
                             onRemove: { remove(col) }
                         )
                         ResizeDivider { delta in
@@ -147,6 +155,16 @@ struct ContentView: View {
         // them (status banner + toolbar) so nothing is clipped at the smallest size.
         .frame(minWidth: 920, minHeight: 700)
         .animation(.easeInOut(duration: 0.2), value: overallStatus)
+        // Pointing a column at a different folder invalidates the whole tree.
+        .onChange(of: columns.map { $0.url?.path ?? "-" }.joined(separator: "|")) { _, _ in
+            expandedRelPaths.removeAll()
+            childCache.removeAll()
+        }
+        // A re-scan (Refresh) keeps the tree open but drops the stale children,
+        // which the expanded rows then reload.
+        .onChange(of: columns.map(\.reloadCount).reduce(0, +)) { _, _ in
+            childCache.removeAll()
+        }
         .sheet(isPresented: $showAbout) { AboutView() }
         .task {
             store.setInitial(count: 2)
@@ -195,6 +213,7 @@ struct ContentView: View {
 
     private func remove(_ col: FolderColumn) {
         columnWidths.removeValue(forKey: col.id)
+        childCache = childCache.filter { $0.key.column != col.id }
         store.remove(id: col.id)
     }
 
@@ -284,11 +303,11 @@ struct ColumnView: View {
     let allColumns: [FolderColumn]
     let width: CGFloat
     let showFileTypeCounts: Bool
+    @Binding var expandedRelPaths: Set<String>
+    @Binding var childCache: [ChildCacheKey: [SubfolderInfo]]
     let onRemove: () -> Void
 
     @State private var isTargeted = false
-    @State private var expandedIDs: Set<UUID> = []
-    @State private var childrenCache: [UUID: [SubfolderInfo]] = [:]
     @State private var expandedTypeIDs: Set<UUID> = []
 
     // Fixed widths for numeric columns
@@ -329,8 +348,6 @@ struct ColumnView: View {
         .frame(width: width)
         .onDrop(of: [UTType.fileURL], isTargeted: $isTargeted, perform: handleDrop)
         .onChange(of: column.url) { _, _ in
-            expandedIDs.removeAll()
-            childrenCache.removeAll()
             expandedTypeIDs.removeAll()
         }
     }
@@ -457,6 +474,9 @@ struct ColumnView: View {
 
                 ForEach(column.subfolders) { sub in
                     ExpandableSubfolderRow(
+                        column: column,
+                        allColumns: allColumns,
+                        relPath: sub.name,
                         name: sub.name,
                         info: sub,
                         depth: 0,
@@ -466,8 +486,8 @@ struct ColumnView: View {
                         // subfolders not yet populated) would flag every row as missing.
                         showStatus: allColumns.count > 1 && allColumns.allSatisfy({ $0.url != nil && !$0.isLoading }),
                         subW: subW, fileW: fileW, sizeW: sizeW,
-                        expandedIDs: $expandedIDs,
-                        childrenCache: $childrenCache,
+                        expandedRelPaths: $expandedRelPaths,
+                        childCache: $childCache,
                         showFileTypeCounts: showFileTypeCounts,
                         expandedTypeIDs: $expandedTypeIDs
                     )
@@ -539,6 +559,10 @@ struct ColumnView: View {
 // MARK: - Expandable Subfolder Row
 
 struct ExpandableSubfolderRow: View {
+    let column: FolderColumn
+    let allColumns: [FolderColumn]
+    /// This folder's path relative to its column root ("Capture/LOOK_7185").
+    let relPath: String
     let name: String
     let info: SubfolderInfo?
     let depth: Int
@@ -548,13 +572,39 @@ struct ExpandableSubfolderRow: View {
     let subW: CGFloat
     let fileW: CGFloat
     let sizeW: CGFloat
-    @Binding var expandedIDs: Set<UUID>
-    @Binding var childrenCache: [UUID: [SubfolderInfo]]
+    @Binding var expandedRelPaths: Set<String>
+    @Binding var childCache: [ChildCacheKey: [SubfolderInfo]]
     var showFileTypeCounts: Bool = false
     @Binding var expandedTypeIDs: Set<UUID>
 
-    private var isExpanded: Bool { info.map { expandedIDs.contains($0.id) } ?? false }
+    private var isExpanded: Bool { expandedRelPaths.contains(relPath) }
     private var canExpand: Bool { (info?.subfolderCount ?? 0) > 0 }
+    private var cacheKey: ChildCacheKey { ChildCacheKey(column: column.id, relPath: relPath) }
+    private var loadedChildren: [SubfolderInfo]? { childCache[cacheKey] }
+
+    /// Compares one child against the same child in every column, once all
+    /// columns have scanned this folder. `nil` = not enough data yet, so the
+    /// child row shows no verdict rather than a wrong one.
+    @MainActor private func nestedStatus(_ child: SubfolderInfo) -> MatchStatus? {
+        guard allColumns.count > 1,
+              allColumns.allSatisfy({ $0.url != nil && !$0.isLoading }) else { return nil }
+        let key = canonicalFolderName(child.name)
+        var entries: [SubfolderInfo?] = []
+        for col in allColumns {
+            guard let kids = childCache[ChildCacheKey(column: col.id, relPath: relPath)] else { return nil }
+            entries.append(kids.first(where: { canonicalFolderName($0.name) == key }))
+        }
+        return compareEntries(entries, columnCount: allColumns.count)
+    }
+
+    @MainActor private func nestedDetail(_ child: SubfolderInfo) -> String? {
+        let key = canonicalFolderName(child.name)
+        let entries = allColumns.map { col -> (path: String, info: SubfolderInfo?) in
+            let kids = childCache[ChildCacheKey(column: col.id, relPath: relPath)]
+            return ("\(col.path)/\(relPath)", kids?.first(where: { canonicalFolderName($0.name) == key }))
+        }
+        return compareDetail(entries, columnCount: allColumns.count)
+    }
     private var canShowTypeCounts: Bool {
         showFileTypeCounts && info?.isLooseFilesRow == true && !(info?.typeCounts.isEmpty ?? true)
     }
@@ -584,17 +634,22 @@ struct ExpandableSubfolderRow: View {
                 }
             }
             if isExpanded, let info {
-                if let children = childrenCache[info.id] {
+                if let children = loadedChildren {
                     ForEach(children) { child in
+                        let st = nestedStatus(child)
                         ExpandableSubfolderRow(
+                            column: column,
+                            allColumns: allColumns,
+                            relPath: relPath + "/" + child.name,
                             name: child.name,
                             info: child,
                             depth: depth + 1,
-                            status: .match,
-                            showStatus: false,
+                            status: st ?? .match,
+                            statusDetail: st != nil ? nestedDetail(child) : nil,
+                            showStatus: st != nil,
                             subW: subW, fileW: fileW, sizeW: sizeW,
-                            expandedIDs: $expandedIDs,
-                            childrenCache: $childrenCache,
+                            expandedRelPaths: $expandedRelPaths,
+                            childCache: $childCache,
                             showFileTypeCounts: showFileTypeCounts,
                             expandedTypeIDs: $expandedTypeIDs
                         )
@@ -609,10 +664,11 @@ struct ExpandableSubfolderRow: View {
                     .padding(.vertical, 6)
                     .task {
                         let url = info.url
+                        let key = cacheKey
                         let loaded = await Task.detached(priority: .userInitiated) {
                             FolderColumn.loadChildren(at: url)
                         }.value
-                        childrenCache[info.id] = loaded
+                        childCache[key] = loaded
                     }
                 }
             }
@@ -637,27 +693,26 @@ struct ExpandableSubfolderRow: View {
                 Spacer().frame(width: indentWidth)
             }
 
-            // Status indicator (only depth 0)
-            if depth == 0 {
-                Group {
-                    if showStatus {
-                        switch status {
-                        case .match:
-                            Spacer().frame(width: 20)
-                        case .mismatch:
-                            Image(systemName: "exclamationmark.circle.fill")
-                                .font(.caption2).foregroundStyle(.orange)
-                                .frame(width: 20)
-                                .help(statusDetail ?? "Contents differ between columns")
-                        case .missing:
-                            Image(systemName: "minus.circle.fill")
-                                .font(.caption2).foregroundStyle(.red)
-                                .frame(width: 20)
-                                .help(statusDetail ?? "Folder not found in every column")
-                        }
-                    } else {
+            // Status indicator — shown at every depth so a flagged folder can be
+            // opened to find exactly which nested folder differs.
+            Group {
+                if showStatus {
+                    switch status {
+                    case .match:
                         Spacer().frame(width: 20)
+                    case .mismatch:
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .font(.caption2).foregroundStyle(.orange)
+                            .frame(width: 20)
+                            .help(statusDetail ?? "Contents differ between columns")
+                    case .missing:
+                        Image(systemName: "minus.circle.fill")
+                            .font(.caption2).foregroundStyle(.red)
+                            .frame(width: 20)
+                            .help(statusDetail ?? "Folder not found in every column")
                     }
+                } else {
+                    Spacer().frame(width: 20)
                 }
             }
 
@@ -683,6 +738,14 @@ struct ExpandableSubfolderRow: View {
                 .truncationMode(.tail)
                 .foregroundStyle(info == nil ? Color.secondary : Color.primary)
                 .padding(.leading, 4)
+
+            if info?.hadReadError == true {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.yellow)
+                    .padding(.leading, 4)
+                    .help("Some items in this folder couldn't be read — its counts are a lower bound.")
+            }
 
             Spacer(minLength: 6)
 
@@ -729,11 +792,10 @@ struct ExpandableSubfolderRow: View {
     }
 
     private func toggleExpand() {
-        guard let info else { return }
         if isExpanded {
-            expandedIDs.remove(info.id)
+            expandedRelPaths.remove(relPath)
         } else {
-            expandedIDs.insert(info.id)
+            expandedRelPaths.insert(relPath)
         }
     }
 
@@ -850,9 +912,10 @@ struct AboutView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         BulletRow("Drop a folder onto any column, or click Browse to pick one.")
                         BulletRow("Add more columns with the + button on the right.")
-                        BulletRow("Click the chevron next to a subfolder to expand and inspect its contents.")
+                        BulletRow("Click the chevron next to a subfolder to expand it — every column expands together, and nested folders carry the same match flags, so you can drill straight down to the folder that differs.")
                         BulletRow("Drag the divider between columns to resize them.")
                         BulletRow("Mismatched subfolders are flagged in orange; folders missing from a column appear in red. Hover the icon for exact file and byte counts — displayed sizes are rounded, so folders can look identical while differing by a few bytes.")
+                        BulletRow("A folder marked ⚠︎ couldn't be fully read (a permissions block or a drive error). Its counts are a lower bound, so it's flagged rather than called a match — try Refresh, or check the drive.")
                         BulletRow("Click a folder's path to change it, or right-click to reveal it in Finder.")
                         BulletRow("Export a plain-text report with the Export button when you're done.")
                     }

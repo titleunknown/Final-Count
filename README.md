@@ -35,7 +35,7 @@ It's built for photographers, Digi-tehs, DITs, editors, and anyone who keeps mir
 - **Side-by-side columns** — compare two or more folders at once
 - **Per-subfolder breakdown** — subdirectory count, file count, and total size for each
 - **Automatic mismatch detection** — differing subfolders flagged in orange, missing ones in red
-- **Expandable rows** — click into any subfolder to inspect its nested contents
+- **Expandable rows** — click into any subfolder to inspect its nested contents; all columns expand together and nested folders carry the same mismatch flags, so you can drill straight to the folder that differs
 - **Drag & drop** — drop a folder onto any column, or onto the Add Folder area to add a new one
 - **Resizable columns** — drag the dividers to fit long folder names
 - **One-click refresh** — re-scan every folder after making changes
@@ -80,7 +80,7 @@ Requires macOS 14.0+ and Xcode 15+.
 1. **Add folders** — drop a folder onto a column, click **Browse**, or use the **+ Add Folder** area on the right
 2. **Read the breakdown** — each row shows a subfolder's subdirectory count, file count, and size; the footer totals everything up
 3. **Spot differences** — when comparing two or more folders, mismatched subfolders are tinted orange and missing ones red
-4. **Dig deeper** — click the chevron beside any subfolder to expand its nested folders
+4. **Dig deeper** — click the chevron beside any subfolder to expand its nested folders; the mismatch flags follow you down, level by level, to the exact folder that differs
 5. **Refresh** — made changes on disk? Hit **Refresh** to re-scan all folders
 6. **Export** — click **Export Report** to save a `.txt` summary confirming whether the locations are identical
 

@@ -50,6 +50,10 @@ struct SubfolderInfo: Identifiable {
     let fileCount: Int
     let byteSize: Int64
     let subfolderCount: Int  // immediate subdirectories only
+    // True when some part of this folder's subtree couldn't be read (permissions,
+    // an I/O error on an external drive). The counts above are then only a lower
+    // bound, so an apparent match can't be trusted.
+    var hadReadError: Bool = false
     // Synthetic row aggregating files that sit directly in the folder rather than
     // in a subfolder — without it, a folder of loose files renders as empty.
     var isLooseFilesRow: Bool = false
@@ -65,6 +69,13 @@ struct SubfolderInfo: Identifiable {
 // Shared so the row compares by name across columns like any real subfolder.
 let looseFilesRowName = "Files (not in a subfolder)"
 
+// Resource keys prefetched for every directory listing, so the follow-up
+// `resourceValues` calls are served from cache.
+private let scanResourceKeys: [URLResourceKey] = [
+    .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey
+]
+private let scanResourceKeySet = Set(scanResourceKeys)
+
 @MainActor
 class FolderColumn: ObservableObject, Identifiable {
     let id = UUID()
@@ -77,6 +88,11 @@ class FolderColumn: ObservableObject, Identifiable {
     // Non-nil when the top-level folder couldn't be read (e.g. macOS denied access),
     // so the UI can distinguish an access failure from a genuinely empty folder.
     @Published var loadError: String?
+    // Count of subfolders whose subtree was only partially readable. Their totals
+    // are a lower bound, so the comparison flags them rather than calling a match.
+    @Published var readErrorCount = 0
+    // Bumped on every load so views can drop caches keyed to a particular scan.
+    @Published private(set) var reloadCount = 0
 
     var name: String { url?.lastPathComponent ?? "" }
     var path: String { url?.path ?? "" }
@@ -87,6 +103,8 @@ class FolderColumn: ObservableObject, Identifiable {
         totalFiles = 0
         totalBytes = 0
         loadError = nil
+        readErrorCount = 0
+        reloadCount += 1
         isLoading = true
 
         Task {
@@ -96,6 +114,7 @@ class FolderColumn: ObservableObject, Identifiable {
             self.subfolders = result.subfolders
             self.totalFiles = result.totalFiles
             self.totalBytes = result.totalBytes
+            self.readErrorCount = result.readErrors
             self.loadError = result.error
             self.isLoading = false
         }
@@ -111,40 +130,51 @@ class FolderColumn: ObservableObject, Identifiable {
         analyzeDirectory(url: url).subfolders
     }
 
-    private nonisolated static func analyzeDirectory(url: URL) -> (subfolders: [SubfolderInfo], totalFiles: Int, totalBytes: Int64, error: String?) {
+    /// Scans one directory: `contentsOfDirectory` for the top level (so loose
+    /// files can be split into their own row) and `walk` for each subfolder.
+    ///
+    /// Both the top level and `walk` share one traversal policy, so a folder's
+    /// totals are identical whether it's the column root here or a nested row
+    /// reached through expansion — the sum of a folder's child rows always
+    /// equals its own total, at every level.
+    private nonisolated static func analyzeDirectory(url: URL) -> (subfolders: [SubfolderInfo], totalFiles: Int, totalBytes: Int64, readErrors: Int, error: String?) {
         let fm = FileManager.default
         let contents: [URL]
         do {
             contents = try fm.contentsOfDirectory(
                 at: url,
-                includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey],
+                includingPropertiesForKeys: scanResourceKeys,
                 options: [.skipsHiddenFiles]
             )
         } catch {
-            return ([], 0, 0, describeAccessError(error))
+            return ([], 0, 0, 0, describeAccessError(error))
         }
 
         var infos: [SubfolderInfo] = []
         var grandTotalFiles = 0
         var grandTotalBytes: Int64 = 0
+        var readErrors = 0
         var looseFiles = 0
         var looseBytes: Int64 = 0
         var looseTypeCounts: [String: (count: Int, bytes: Int64)] = [:]
 
         for item in contents.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-            let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey])
+            let values = try? item.resourceValues(forKeys: scanResourceKeySet)
+            // Symbolic links are neither followed nor counted — see `walk`.
+            if values?.isSymbolicLink == true { continue }
             if values?.isDirectory == true {
-                let (fileCount, bytes) = deepCount(at: item, fm: fm)
-                let subfolderCount = immediateSubdirCount(at: item, fm: fm)
+                let t = walk(item, fm: fm)
                 infos.append(SubfolderInfo(
                     name: item.lastPathComponent,
                     url: item,
-                    fileCount: fileCount,
-                    byteSize: bytes,
-                    subfolderCount: subfolderCount
+                    fileCount: t.files,
+                    byteSize: t.bytes,
+                    subfolderCount: t.immediateSubdirs,
+                    hadReadError: t.readError
                 ))
-                grandTotalFiles += fileCount
-                grandTotalBytes += bytes
+                grandTotalFiles += t.files
+                grandTotalBytes += t.bytes
+                if t.readError { readErrors += 1 }
             } else if values?.isRegularFile == true {
                 looseFiles += 1
                 let size = Int64(values?.fileSize ?? 0)
@@ -172,7 +202,7 @@ class FolderColumn: ObservableObject, Identifiable {
             grandTotalBytes += looseBytes
         }
 
-        return (infos, grandTotalFiles, grandTotalBytes, nil)
+        return (infos, grandTotalFiles, grandTotalBytes, readErrors, nil)
     }
 
     /// Turns a directory-read failure into a message aimed at the likely cause: a
@@ -188,37 +218,63 @@ class FolderColumn: ObservableObject, Identifiable {
         return "Couldn't read this folder: \(nsError.localizedDescription)"
     }
 
-    private nonisolated static func deepCount(at url: URL, fm: FileManager) -> (Int, Int64) {
-        guard let enumerator = fm.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
-        ) else { return (0, 0) }
+    /// Recursively totals a directory subtree. The single traversal policy used
+    /// everywhere in the app, applied identically at every depth:
+    ///
+    ///  • hidden entries are skipped (`.skipsHiddenFiles`);
+    ///  • symbolic links are neither followed nor counted — this rules out link
+    ///    cycles, keeps out data that lives outside the tree, and makes the total
+    ///    independent of which folder the scan started from;
+    ///  • a directory that can't be listed contributes whatever was readable and
+    ///    sets `readError`, so a scan interrupted by an I/O error on an external
+    ///    drive is reported instead of silently passing as a match.
+    private nonisolated static func walk(_ url: URL, fm: FileManager) -> (files: Int, bytes: Int64, immediateSubdirs: Int, readError: Bool) {
+        let contents: [URL]
+        do {
+            contents = try fm.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: scanResourceKeys,
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            return (0, 0, 0, true)
+        }
 
-        var count = 0
+        var files = 0
         var bytes: Int64 = 0
-        for case let fileURL as URL in enumerator {
-            if (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
-                count += 1
-                bytes += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        var immediateSubdirs = 0
+        var readError = false
+
+        for item in contents {
+            let values = try? item.resourceValues(forKeys: scanResourceKeySet)
+            if values?.isSymbolicLink == true { continue }
+            if values?.isDirectory == true {
+                immediateSubdirs += 1
+                let sub = walk(item, fm: fm)
+                files += sub.files
+                bytes += sub.bytes
+                readError = readError || sub.readError
+            } else if values?.isRegularFile == true {
+                files += 1
+                bytes += Int64(values?.fileSize ?? 0)
             }
         }
-        return (count, bytes)
-    }
-
-    private nonisolated static func immediateSubdirCount(at url: URL, fm: FileManager) -> Int {
-        let contents = try? fm.contentsOfDirectory(
-            at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
-        )
-        return contents?.filter {
-            (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-        }.count ?? 0
+        return (files, bytes, immediateSubdirs, readError)
     }
 }
 
 // MARK: - Comparison
 
 enum MatchStatus { case match, mismatch, missing }
+
+/// Identifies one folder's scanned children in the shared expansion cache: which
+/// column, and the folder's path relative to that column's root (e.g.
+/// "Capture/LOOK_7185"). The relative path lets the same nested folder be matched
+/// across columns the way top-level rows are matched by name.
+struct ChildCacheKey: Hashable {
+    let column: UUID
+    let relPath: String
+}
 
 /// Folder names that look identical can differ invisibly (trailing spaces, case,
 /// width/diacritic variants) across volumes and copy tools; treat those as the same folder.
@@ -227,33 +283,55 @@ func canonicalFolderName(_ s: String) -> String {
         .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
 }
 
-@MainActor func statusFor(name: String, in columns: [FolderColumn]) -> MatchStatus {
-    let key = canonicalFolderName(name)
-    let entries = columns.compactMap { $0.subfolders.first(where: { canonicalFolderName($0.name) == key }) }
-    guard entries.count == columns.count else { return .missing }
-    let first = entries[0]
-    return entries.dropFirst().allSatisfy({ $0.fileCount == first.fileCount && $0.byteSize == first.byteSize })
+/// Compares the same folder as seen from each column — one optional `SubfolderInfo`
+/// per column, `nil` where the folder is absent. Shared by the top-level rows and
+/// by nested rows once their children have been scanned.
+func compareEntries(_ entries: [SubfolderInfo?], columnCount: Int) -> MatchStatus {
+    let found = entries.compactMap { $0 }
+    guard found.count == columnCount else { return .missing }
+    // A partially-readable subtree makes an apparent match meaningless.
+    if found.contains(where: { $0.hadReadError }) { return .mismatch }
+    let first = found[0]
+    return found.dropFirst().allSatisfy({ $0.fileCount == first.fileCount && $0.byteSize == first.byteSize })
         ? .match : .mismatch
 }
 
 /// Explains a non-matching row with exact numbers, since the displayed sizes are
 /// rounded and can look identical while the byte counts differ. Returns nil for matches.
-@MainActor func statusDetail(name: String, in columns: [FolderColumn]) -> String? {
-    let key = canonicalFolderName(name)
-    let entries = columns.map { col in
-        col.subfolders.first(where: { canonicalFolderName($0.name) == key })
-    }
-    let missingFrom = zip(columns, entries).filter { $0.1 == nil }.map { $0.0.path }
+/// `entries` pairs each column's path (for the message) with its folder, if present.
+func compareDetail(_ entries: [(path: String, info: SubfolderInfo?)], columnCount: Int) -> String? {
+    let missingFrom = entries.filter { $0.info == nil }.map { $0.path }
     if !missingFrom.isEmpty {
         return "Not found in:\n" + missingFrom.joined(separator: "\n")
     }
-    let found = entries.compactMap { $0 }
-    guard let first = found.first,
-          found.dropFirst().contains(where: { $0.fileCount != first.fileCount || $0.byteSize != first.byteSize })
-    else { return nil }
-    return zip(columns, found).map { col, e in
-        "\(col.path): \(e.fileCount.formatted()) files, \(e.byteSize.formatted()) bytes"
+    let found = entries.compactMap { $0.info }
+    guard let first = found.first else { return nil }
+    let differs = found.dropFirst().contains { $0.fileCount != first.fileCount || $0.byteSize != first.byteSize }
+    let unreadable = found.contains { $0.hadReadError }
+    guard differs || unreadable else { return nil }
+    var text = entries.map { e -> String in
+        guard let i = e.info else { return "\(e.path): —" }
+        return "\(e.path): \(i.fileCount.formatted()) files, \(i.byteSize.formatted()) bytes"
+            + (i.hadReadError ? "  ⚠︎ some items unreadable" : "")
     }.joined(separator: "\n")
+    if unreadable {
+        text += "\n\nCounts are a lower bound — some items couldn't be read, so a match can't be confirmed."
+    }
+    return text
+}
+
+@MainActor func statusFor(name: String, in columns: [FolderColumn]) -> MatchStatus {
+    let key = canonicalFolderName(name)
+    let entries = columns.map { $0.subfolders.first(where: { canonicalFolderName($0.name) == key }) }
+    return compareEntries(entries, columnCount: columns.count)
+}
+
+@MainActor func statusDetail(name: String, in columns: [FolderColumn]) -> String? {
+    let key = canonicalFolderName(name)
+    let entries = columns.map { col in
+        (path: col.path, info: col.subfolders.first(where: { canonicalFolderName($0.name) == key }))
+    }
+    return compareDetail(entries, columnCount: columns.count)
 }
 
 @MainActor func allSubfolderNames(in columns: [FolderColumn]) -> [String] {
@@ -290,7 +368,8 @@ private func lpad(_ s: String, _ w: Int) -> String {
         lines.append("  " + rpad("Subfolder", 32) + " " + lpad("Subdirs", 8) + "  " + lpad("Files", 8) + "  " + lpad("Size", 12))
         lines.append("    " + String(repeating: "─", count: 68))
         for sub in col.subfolders {
-            lines.append("  " + rpad(sub.name, 32) + " " + lpad(sub.formattedSubfolderCount, 8) + "  " + lpad(sub.formattedCount, 8) + "  " + lpad(sub.formattedSize, 12))
+            let flag = sub.hadReadError ? " ⚠︎" : ""
+            lines.append("  " + rpad(sub.name + flag, 32) + " " + lpad(sub.formattedSubfolderCount, 8) + "  " + lpad(sub.formattedCount, 8) + "  " + lpad(sub.formattedSize, 12))
         }
         lines.append("    " + String(repeating: "─", count: 68))
         let totalLabel = "TOTAL (\(col.subfolders.filter { !$0.isLooseFilesRow }.count) folders)"
@@ -309,6 +388,11 @@ private func lpad(_ s: String, _ w: Int) -> String {
         } else {
             lines.append("✗ Mismatches found (\(mismatches.count)):")
             for m in mismatches { lines.append("  • \(m)") }
+        }
+        if columns.contains(where: { $0.readErrorCount > 0 }) {
+            lines.append("")
+            lines.append("⚠︎ Some folders (marked ⚠︎ above) could not be fully read; their counts are")
+            lines.append("  a lower bound and any match involving them is unconfirmed.")
         }
     }
 
