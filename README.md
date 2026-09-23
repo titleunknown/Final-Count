@@ -35,11 +35,16 @@ It's built for photographers, Digi-tehs, DITs, editors, and anyone who keeps mir
 - **Side-by-side columns** — compare two or more folders at once
 - **Per-subfolder breakdown** — subdirectory count, file count, and total size for each
 - **Automatic mismatch detection** — differing subfolders flagged in orange, missing ones in red
+- **Catches renamed and moved files** — folders are compared on file names and folder layout as well as file counts and sizes, so two folders with the same totals but different contents still get flagged
+- **Same-folder warning** — if two columns point to the same folder on disk (even through an alias, symlink, or a different path), Final Count warns you instead of calling it a match; it also notes when two copies sit on the same drive
+- **Show only differences** — hide every subfolder that matches so the problems stand out
 - **Expandable rows** — click into any subfolder to inspect its nested contents; all columns expand together and nested folders carry the same mismatch flags, so you can drill straight to the folder that differs
 - **Drag & drop** — drop a folder onto any column, or onto the Add Folder area to add a new one
 - **Resizable columns** — drag the dividers to fit long folder names
 - **One-click refresh** — re-scan every folder after making changes
-- **Export report** — save a plain-text report verifying whether all locations are identical
+- **Export report** — save a plain-text report verifying whether all locations are identical, listing every difference down to the exact folder and file names
+- **Hidden files option** — include dot-files in the counts when you need them (skipped by default)
+- **Keyboard shortcuts** — ⌘O add a folder, ⌘R refresh, ⌘E export, ⇧⌘D show only differences, ⇧⌘. hidden files
 - **Clean, native interface** — follows macOS light/dark mode, nothing to configure
 
 ---
@@ -79,10 +84,14 @@ Requires macOS 14.0+ and Xcode 15+.
 
 1. **Add folders** — drop a folder onto a column, click **Browse**, or use the **+ Add Folder** area on the right
 2. **Read the breakdown** — each row shows a subfolder's subdirectory count, file count, and size; the footer totals everything up
-3. **Spot differences** — when comparing two or more folders, mismatched subfolders are tinted orange and missing ones red
+3. **Spot differences** — when comparing two or more folders, mismatched subfolders are tinted orange and missing ones red; tick **Only Differences** to hide everything that matches
 4. **Dig deeper** — click the chevron beside any subfolder to expand its nested folders; the mismatch flags follow you down, level by level, to the exact folder that differs
 5. **Refresh** — made changes on disk? Hit **Refresh** to re-scan all folders
-6. **Export** — click **Export Report** to save a `.txt` summary confirming whether the locations are identical
+6. **Export** — click **Export Report** to save a `.txt` summary confirming whether the locations are identical; any differences are traced down to the exact folders and files
+
+### What "identical" means
+
+Final Count compares **file names, folder layout, file counts, and file sizes** at every level. That catches missing, extra, renamed, moved, and truncated files. It does **not** read or checksum file contents, so a file that was corrupted without changing size would not be detected.
 
 ---
 

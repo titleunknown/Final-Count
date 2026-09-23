@@ -14,8 +14,12 @@ struct ContentView: View {
     @State private var columnWidths: [UUID: CGFloat] = [:]  // only set once user drags
     @State private var viewWidth: CGFloat = 900
     @State private var showExportSuccess = false
+    @State private var isExporting = false
+    @State private var exportError: String?
     @State private var showAbout = false
     @State private var showFileTypeCounts = false
+    @State private var showOnlyDifferences = false
+    @AppStorage("includeHiddenFiles") private var includeHiddenFiles = false
     // Expansion and scanned children live here, not in each ColumnView, so every
     // column expands in lockstep and a nested folder can be compared across
     // columns the same way top-level rows are. Keyed by path relative to the
@@ -37,23 +41,24 @@ struct ContentView: View {
         return max(minColWidth, available / max(1, CGFloat(columns.count)))
     }
 
-    /// Overall verdict shown in the status bar. `.notReady` while there's fewer
-    /// than two folders, or any is still scanning or failed to load — comparing
-    /// then would be meaningless or would falsely flag everything.
-    private enum OverallStatus: Equatable {
-        case notReady
-        case identical
-        case differences(Int)
+    private var overallStatus: ComparisonState { comparisonState(for: columns) }
+
+    /// Other columns (0-based) that point at the same folder on disk as `col`.
+    private func duplicatePartners(of col: FolderColumn) -> [Int] {
+        guard let i = columns.firstIndex(where: { $0.id == col.id }) else { return [] }
+        let group = duplicateFolderGroups(columns.map(\.identity)).first { $0.contains(i) }
+        return group?.filter { $0 != i } ?? []
     }
 
-    private var overallStatus: OverallStatus {
-        let ready = columns.count > 1
-            && columns.allSatisfy { $0.url != nil && !$0.isLoading && $0.loadError == nil }
-        guard ready else { return .notReady }
-        let mismatchCount = allSubfolderNames(in: columns)
-            .filter { statusFor(name: $0, in: columns) != .match }
-            .count
-        return mismatchCount == 0 ? .identical : .differences(mismatchCount)
+    /// A gentle heads-up when a "backup" lives on the same drive as another copy.
+    private var sameVolumeNote: String? {
+        guard let g = sameVolumeGroups(columns.map(\.identity)).first else { return nil }
+        let volume = columns[g[0]].identity?.volumeName.map { " (\($0))" } ?? ""
+        return "\(columnList(g).uppercasingFirst) are on the same drive\(volume), so that copy won't protect against the drive failing."
+    }
+
+    private var canExport: Bool {
+        !isExporting && columns.contains { $0.url != nil } && !columns.contains { $0.isLoading }
     }
 
     @ViewBuilder
@@ -61,12 +66,21 @@ struct ContentView: View {
         switch overallStatus {
         case .notReady:
             EmptyView()
+        case .sameFolder(let groups):
+            StatusBanner(
+                icon: "exclamationmark.octagon.fill",
+                tint: .red,
+                title: "Same folder selected twice",
+                subtitle: "\(columnList(groups[0]).uppercasingFirst) are the same folder on disk, so they can't verify each other. Choose the other copy instead."
+            )
+            .transition(.move(edge: .bottom).combined(with: .opacity))
         case .identical:
             StatusBanner(
                 icon: "checkmark.seal.fill",
                 tint: .green,
                 title: "All folders are identical",
-                subtitle: "Every subfolder matches on file count and size."
+                subtitle: "Every subfolder matches on file names, file count, and size.",
+                note: sameVolumeNote
             )
             .transition(.move(edge: .bottom).combined(with: .opacity))
         case .differences(let n):
@@ -90,6 +104,8 @@ struct ContentView: View {
                             allColumns: columns,
                             width: columnWidth(for: col),
                             showFileTypeCounts: showFileTypeCounts,
+                            showOnlyDifferences: showOnlyDifferences,
+                            duplicatePartners: duplicatePartners(of: col),
                             expandedRelPaths: $expandedRelPaths,
                             childCache: $childCache,
                             onRemove: { remove(col) }
@@ -129,17 +145,36 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .help("Re-scan all folders")
 
+                Toggle("Only Differences", isOn: $showOnlyDifferences)
+                    .toggleStyle(.checkbox)
+                    .help("Hide subfolders that match in every column (⇧⌘D)")
+                    .padding(.leading, 12)
+
                 Toggle("File Type Counts", isOn: $showFileTypeCounts)
                     .toggleStyle(.checkbox)
                     .help("Show a breakdown by file extension for loose files")
-                    .padding(.leading, 12)
+                    .padding(.leading, 8)
+
+                Toggle("Hidden Files", isOn: $includeHiddenFiles)
+                    .toggleStyle(.checkbox)
+                    .help("Include hidden files and folders (names starting with a dot) in the counts (⇧⌘.)")
+                    .padding(.leading, 8)
 
                 Spacer()
 
                 Button(action: exportReport) {
-                    Label("Export Report", systemImage: "square.and.arrow.up")
+                    HStack(spacing: 5) {
+                        if isExporting {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                        Text(isExporting ? "Preparing Report…" : "Export Report")
+                    }
                 }
                 .buttonStyle(.bordered)
+                .disabled(!canExport)
+                .help("Save a plain-text report of this comparison (⌘E)")
 
                 Button(action: { showAbout = true }) {
                     Label("About", systemImage: "info.circle")
@@ -165,8 +200,31 @@ struct ContentView: View {
         .onChange(of: columns.map(\.reloadCount).reduce(0, +)) { _, _ in
             childCache.removeAll()
         }
+        .onChange(of: includeHiddenFiles) { _, newValue in
+            store.includeHiddenFiles = newValue
+            refreshAll()
+        }
         .sheet(isPresented: $showAbout) { AboutView() }
+        .alert("Couldn't Save Report", isPresented: Binding(
+            get: { exportError != nil },
+            set: { if !$0 { exportError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(exportError ?? "")
+        }
+        .focusedSceneValue(\.windowActions, WindowActions(
+            addFolder: addColumn,
+            refresh: refreshAll,
+            exportReport: exportReport,
+            canRefresh: columns.contains { $0.url != nil },
+            canExport: canExport,
+            showOnlyDifferences: $showOnlyDifferences,
+            showFileTypeCounts: $showFileTypeCounts,
+            includeHiddenFiles: $includeHiddenFiles
+        ))
         .task {
+            store.includeHiddenFiles = includeHiddenFiles
             store.setInitial(count: 2)
         }
         .overlay(alignment: .bottom) {
@@ -204,6 +262,7 @@ struct ContentView: View {
     }
 
     @MainActor private func addColumn(url: URL) {
+        guard isFolder(url) else { NSSound.beep(); return }
         let col = FolderColumn()
         col.load(from: url)
         // New column starts at the current default (no explicit entry),
@@ -218,17 +277,29 @@ struct ContentView: View {
     }
 
     @MainActor private func exportReport() {
-        let text = buildReport(columns: columns)
+        guard canExport else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.plainText]
         panel.nameFieldStringValue = "FinalCount-Report.txt"
-        if panel.runModal() == .OK, let url = panel.url {
-            try? text.write(to: url, atomically: true, encoding: .utf8)
-            withAnimation { showExportSuccess = true }
-            Task {
-                try? await Task.sleep(for: .seconds(2))
-                await MainActor.run { withAnimation { showExportSuccess = false } }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        // Snapshot now; locating nested differences re-scans the mismatched
+        // branches, which can take a while on a big drive.
+        let input = ReportInput(columns: columns, includeHidden: includeHiddenFiles,
+                                appVersion: AboutView.appVersion)
+        isExporting = true
+        Task {
+            let text = await Task.detached(priority: .userInitiated) { buildReport(input) }.value
+            isExporting = false
+            do {
+                try text.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                exportError = error.localizedDescription
+                return
             }
+            withAnimation { showExportSuccess = true }
+            try? await Task.sleep(for: .seconds(2))
+            withAnimation { showExportSuccess = false }
         }
     }
 }
@@ -242,6 +313,7 @@ struct StatusBanner: View {
     let tint: Color
     let title: String
     let subtitle: String
+    var note: String? = nil
 
     var body: some View {
         HStack(spacing: 12) {
@@ -255,6 +327,12 @@ struct StatusBanner: View {
                 Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let note {
+                    Label(note, systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 2)
+                }
             }
             Spacer()
         }
@@ -303,6 +381,9 @@ struct ColumnView: View {
     let allColumns: [FolderColumn]
     let width: CGFloat
     let showFileTypeCounts: Bool
+    let showOnlyDifferences: Bool
+    /// Other columns (0-based) pointing at this same folder on disk.
+    let duplicatePartners: [Int]
     @Binding var expandedRelPaths: Set<String>
     @Binding var childCache: [ChildCacheKey: [SubfolderInfo]]
     let onRemove: () -> Void
@@ -318,6 +399,9 @@ struct ColumnView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            if !duplicatePartners.isEmpty {
+                sameFolderWarning
+            }
             Divider()
 
             if column.isLoading {
@@ -399,6 +483,19 @@ struct ColumnView: View {
         .background(Color.primary.opacity(0.06))
     }
 
+    // MARK: Same-folder warning
+
+    private var sameFolderWarning: some View {
+        Label("Same folder as \(columnList(duplicatePartners))", systemImage: "exclamationmark.octagon.fill")
+            .font(.caption).fontWeight(.semibold)
+            .foregroundStyle(.red)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(Color.red.opacity(0.12))
+            .help("This column and \(columnList(duplicatePartners)) (counting from the left) point to the same folder on disk, so comparing them proves nothing. Choose the other copy — for example, the backup drive.")
+    }
+
     // MARK: Drop prompt
 
     private var dropPrompt: some View {
@@ -472,7 +569,13 @@ struct ColumnView: View {
 
                 Divider()
 
-                ForEach(column.subfolders) { sub in
+                if visibleSubfolders.isEmpty && showOnlyDifferences && canShowStatus {
+                    Text("No differences")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 24)
+                }
+                ForEach(visibleSubfolders) { sub in
                     ExpandableSubfolderRow(
                         column: column,
                         allColumns: allColumns,
@@ -482,19 +585,29 @@ struct ColumnView: View {
                         depth: 0,
                         status: statusFor(name: sub.name, in: allColumns),
                         statusDetail: statusDetail(name: sub.name, in: allColumns),
-                        // Comparing against a column that is still scanning (url set,
-                        // subfolders not yet populated) would flag every row as missing.
-                        showStatus: allColumns.count > 1 && allColumns.allSatisfy({ $0.url != nil && !$0.isLoading }),
+                        showStatus: canShowStatus,
                         subW: subW, fileW: fileW, sizeW: sizeW,
                         expandedRelPaths: $expandedRelPaths,
                         childCache: $childCache,
                         showFileTypeCounts: showFileTypeCounts,
+                        showOnlyDifferences: showOnlyDifferences,
                         expandedTypeIDs: $expandedTypeIDs
                     )
                     Divider().padding(.leading, 14)
                 }
             }
         }
+    }
+
+    // Comparing against a column that is still scanning (url set, subfolders not
+    // yet populated) would flag every row as missing.
+    private var canShowStatus: Bool {
+        allColumns.count > 1 && allColumns.allSatisfy({ $0.url != nil && !$0.isLoading })
+    }
+
+    private var visibleSubfolders: [SubfolderInfo] {
+        guard showOnlyDifferences && canShowStatus else { return column.subfolders }
+        return column.subfolders.filter { statusFor(name: $0.name, in: allColumns) != .match }
     }
 
     // MARK: Totals
@@ -546,7 +659,11 @@ struct ColumnView: View {
         provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
             guard let data = item as? Data,
                   let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-            Task { @MainActor in column.load(from: url) }
+            Task { @MainActor in
+                // A dropped file would otherwise replace this column with an error.
+                guard isFolder(url) else { NSSound.beep(); return }
+                column.load(from: url)
+            }
         }
         return true
     }
@@ -575,6 +692,7 @@ struct ExpandableSubfolderRow: View {
     @Binding var expandedRelPaths: Set<String>
     @Binding var childCache: [ChildCacheKey: [SubfolderInfo]]
     var showFileTypeCounts: Bool = false
+    var showOnlyDifferences: Bool = false
     @Binding var expandedTypeIDs: Set<UUID>
 
     private var isExpanded: Bool { expandedRelPaths.contains(relPath) }
@@ -635,7 +753,8 @@ struct ExpandableSubfolderRow: View {
             }
             if isExpanded, let info {
                 if let children = loadedChildren {
-                    ForEach(children) { child in
+                    // Children whose verdict isn't known yet stay visible.
+                    ForEach(children.filter { !showOnlyDifferences || nestedStatus($0) != .match }) { child in
                         let st = nestedStatus(child)
                         ExpandableSubfolderRow(
                             column: column,
@@ -651,6 +770,7 @@ struct ExpandableSubfolderRow: View {
                             expandedRelPaths: $expandedRelPaths,
                             childCache: $childCache,
                             showFileTypeCounts: showFileTypeCounts,
+                            showOnlyDifferences: showOnlyDifferences,
                             expandedTypeIDs: $expandedTypeIDs
                         )
                         Divider().padding(.leading, indentWidth + 14)
@@ -662,12 +782,18 @@ struct ExpandableSubfolderRow: View {
                         Spacer()
                     }
                     .padding(.vertical, 6)
-                    .task {
+                    // Keyed to the scan, so a Refresh mid-load restarts it rather
+                    // than leaving the spinner up forever.
+                    .task(id: column.reloadCount) {
                         let url = info.url
                         let key = cacheKey
+                        let generation = column.reloadCount
+                        let includeHidden = column.includeHiddenFiles
                         let loaded = await Task.detached(priority: .userInitiated) {
-                            FolderColumn.loadChildren(at: url)
+                            FolderColumn.loadChildren(at: url, includeHidden: includeHidden)
                         }.value
+                        // A Refresh while this ran made these children stale.
+                        guard generation == column.reloadCount else { return }
                         childCache[key] = loaded
                     }
                 }
@@ -860,9 +986,10 @@ struct AboutView: View {
 
     private static let repoURL = URL(string: "https://github.com/titleunknown/Final-Count")!
 
-    private var appVersion: String {
+    static var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
     }
+    private var appVersion: String { Self.appVersion }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -915,9 +1042,14 @@ struct AboutView: View {
                         BulletRow("Click the chevron next to a subfolder to expand it — every column expands together, and nested folders carry the same match flags, so you can drill straight down to the folder that differs.")
                         BulletRow("Drag the divider between columns to resize them.")
                         BulletRow("Mismatched subfolders are flagged in orange; folders missing from a column appear in red. Hover the icon for exact file and byte counts — displayed sizes are rounded, so folders can look identical while differing by a few bytes.")
+                        BulletRow("Folders are compared on file names, folder layout, file counts, and sizes, so a renamed or moved file is caught too. File contents aren't checksummed.")
+                        BulletRow("Turn on Only Differences (⇧⌘D) to hide everything that matches.")
+                        BulletRow("If two columns point to the same folder on disk — even through an alias or a different path — Final Count warns you instead of calling it a match.")
+                        BulletRow("Hidden files (names starting with a dot) are skipped unless you turn on Hidden Files (⇧⌘.).")
                         BulletRow("A folder marked ⚠︎ couldn't be fully read (a permissions block or a drive error). Its counts are a lower bound, so it's flagged rather than called a match — try Refresh, or check the drive.")
                         BulletRow("Click a folder's path to change it, or right-click to reveal it in Finder.")
-                        BulletRow("Export a plain-text report with the Export button when you're done.")
+                        BulletRow("Export a plain-text report (⌘E) when you're done. It lists every difference down to the exact folder or file that differs.")
+                        BulletRow("Shortcuts: ⌘O add a folder, ⌘R refresh, ⌘E export.")
                     }
                 }
                 .padding(24)
