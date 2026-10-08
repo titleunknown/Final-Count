@@ -16,7 +16,7 @@ struct Final_CountApp: App {
         .commands {
             FinalCountCommands()
         }
-        .defaultSize(width: 1100, height: 750)
+        .defaultSize(width: 1000, height: 700)
     }
 }
 

@@ -41,8 +41,10 @@ It's built for photographers, Digi-tehs, DITs, editors, and anyone who keeps mir
 - **Expandable rows** — click into any subfolder to inspect its nested contents; all columns expand together and nested folders carry the same mismatch flags, so you can drill straight to the folder that differs
 - **Drag & drop** — drop a folder onto any column, or onto the Add Folder area to add a new one
 - **Resizable columns** — drag the dividers to fit long folder names
+- **Quiet update check** — looks for a newer release at launch (at most once a day) and just swaps the About label to "Update available"; no popups. Turn it off in About
 - **One-click refresh** — re-scan every folder after making changes
 - **Export report** — save a plain-text report verifying whether all locations are identical, listing every difference down to the exact folder and file names
+- **Ignore patterns** — leave files and folders with certain names out of the comparison (`.DS_Store`, a Capture One `Cache` folder, `*.tmp`, and so on). Choose from presets or add your own names with `*` / `?` wildcards. Off by default, and anything skipped is called out in the status banner and the exported report so a match never looks stricter than it is
 - **Hidden files option** — include dot-files in the counts when you need them (skipped by default)
 - **Keyboard shortcuts** — ⌘O add a folder, ⌘R refresh, ⌘E export, ⇧⌘D show only differences, ⇧⌘. hidden files
 - **Clean, native interface** — follows macOS light/dark mode, nothing to configure
@@ -86,12 +88,13 @@ Requires macOS 14.0+ and Xcode 15+.
 2. **Read the breakdown** — each row shows a subfolder's subdirectory count, file count, and size; the footer totals everything up
 3. **Spot differences** — when comparing two or more folders, mismatched subfolders are tinted orange and missing ones red; tick **Only Differences** to hide everything that matches
 4. **Dig deeper** — click the chevron beside any subfolder to expand its nested folders; the mismatch flags follow you down, level by level, to the exact folder that differs
-5. **Refresh** — made changes on disk? Hit **Refresh** to re-scan all folders
-6. **Export** — click **Export Report** to save a `.txt` summary confirming whether the locations are identical; any differences are traced down to the exact folders and files
+5. **Ignore noise** — click **Ignore** to skip files like `.DS_Store` or cache folders you don't want counted; the status banner always shows what was left out
+6. **Refresh** — made changes on disk? Hit **Refresh** to re-scan all folders
+7. **Export** — click **Export Report** to save a `.txt` summary confirming whether the locations are identical; any differences are traced down to the exact folders and files
 
 ### What "identical" means
 
-Final Count compares **file names, folder layout, file counts, and file sizes** at every level. That catches missing, extra, renamed, moved, and truncated files. It does **not** read or checksum file contents, so a file that was corrupted without changing size would not be detected.
+Final Count compares **file names, folder layout, file counts, and file sizes** at every level (minus any names you've chosen to ignore). That catches missing, extra, renamed, moved, and truncated files. It does **not** read or checksum file contents, so a file that was corrupted without changing size would not be detected.
 
 ---
 

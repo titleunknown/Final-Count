@@ -17,9 +17,17 @@ struct ContentView: View {
     @State private var isExporting = false
     @State private var exportError: String?
     @State private var showAbout = false
+    // Owned here (not by the About sheet) so a launch-time check can flag an update on the toolbar.
+    @StateObject private var updater = UpdateChecker()
     @State private var showFileTypeCounts = false
     @State private var showOnlyDifferences = false
     @AppStorage("includeHiddenFiles") private var includeHiddenFiles = false
+    // Ignore rules (all off by default, so comparisons are strict until opted in).
+    // Stored as strings because AppStorage can't hold arrays: preset ids and custom
+    // names, each separated by newlines.
+    @AppStorage("ignorePresetIDs") private var ignorePresetIDs = ""
+    @AppStorage("ignoreCustomNames") private var ignoreCustomNames = ""
+    @State private var showIgnorePopover = false
     // Expansion and scanned children live here, not in each ColumnView, so every
     // column expands in lockstep and a nested folder can be compared across
     // columns the same way top-level rows are. Keyed by path relative to the
@@ -39,6 +47,34 @@ struct ContentView: View {
         let dividerSpace = CGFloat(columns.count) * 8
         let available = viewWidth - addButtonWidth - dividerSpace
         return max(minColWidth, available / max(1, CGFloat(columns.count)))
+    }
+
+    private var scanSettings: ScanSettings {
+        let presetIDs = Set(ignorePresetIDs.split(separator: "\n").map(String.init))
+        let presetNames = IgnorePreset.all.filter { presetIDs.contains($0.id) }.flatMap(\.patterns)
+        let custom = ignoreCustomNames.split(separator: "\n").map(String.init)
+        var names: [String] = []
+        for n in presetNames + custom where !names.contains(n) { names.append(n) }
+        return ScanSettings(includeHidden: includeHiddenFiles, ignoreNames: names)
+    }
+
+    /// Tells the user what the ignore rules left out, so a match is never
+    /// mistaken for a stricter one than it is. Nil when no rules are active.
+    private var ignoreNote: String? {
+        let settings = scanSettings
+        guard settings.hasIgnoreRules, !columns.contains(where: \.isLoading) else { return nil }
+        let counts = columns.filter { $0.url != nil && $0.loadError == nil }.map(\.ignoredCount)
+        let rules = "Ignoring \(settings.ignoreNames.count) name\(settings.ignoreNames.count == 1 ? "" : "s")"
+        guard let first = counts.first else { return rules }
+        if counts.allSatisfy({ $0 == first }) {
+            return "\(rules): \(first.formatted()) matching item\(first == 1 ? "" : "s") skipped in each folder."
+        }
+        return "\(rules): items skipped per folder: " + counts.map { $0.formatted() }.joined(separator: ", ") + "."
+    }
+
+    private var updaterHasUpdate: Bool {
+        if case .available = updater.status { return true }
+        return false
     }
 
     private var overallStatus: ComparisonState { comparisonState(for: columns) }
@@ -80,7 +116,8 @@ struct ContentView: View {
                 tint: .green,
                 title: "All folders are identical",
                 subtitle: "Every subfolder matches on file names, file count, and size.",
-                note: sameVolumeNote
+                note: sameVolumeNote,
+                ignoreNote: ignoreNote
             )
             .transition(.move(edge: .bottom).combined(with: .opacity))
         case .differences(let n):
@@ -88,7 +125,8 @@ struct ContentView: View {
                 icon: "exclamationmark.triangle.fill",
                 tint: .red,
                 title: "\(n) difference\(n == 1 ? "" : "s") found",
-                subtitle: "Highlighted subfolders differ or are missing."
+                subtitle: "Highlighted subfolders differ or are missing.",
+                ignoreNote: ignoreNote
             )
             .transition(.move(edge: .bottom).combined(with: .opacity))
         }
@@ -118,7 +156,7 @@ struct ContentView: View {
                     AddColumnButton(action: addColumn, onDropURL: addColumn(url:))
                         .frame(width: addButtonWidth)
                 }
-                .frame(minWidth: viewWidth, minHeight: 560, alignment: .leading)
+                .frame(minWidth: viewWidth, minHeight: 250, alignment: .leading)
             }
             // Capture window width so defaultColWidth() stays in sync with window resizing
             .background(
@@ -160,6 +198,18 @@ struct ContentView: View {
                     .help("Include hidden files and folders (names starting with a dot) in the counts (⇧⌘.)")
                     .padding(.leading, 8)
 
+                Button { showIgnorePopover.toggle() } label: {
+                    Label(scanSettings.hasIgnoreRules ? "Ignore (\(scanSettings.ignoreNames.count))" : "Ignore",
+                          systemImage: "eye.slash")
+                }
+                .buttonStyle(.bordered)
+                .tint(scanSettings.hasIgnoreRules ? .orange : nil)
+                .padding(.leading, 8)
+                .help("Leave files and folders with certain names out of the comparison")
+                .popover(isPresented: $showIgnorePopover, arrowEdge: .top) {
+                    IgnorePopover(presetIDs: $ignorePresetIDs, customNames: $ignoreCustomNames)
+                }
+
                 Spacer()
 
                 Button(action: exportReport) {
@@ -177,18 +227,25 @@ struct ContentView: View {
                 .help("Save a plain-text report of this comparison (⌘E)")
 
                 Button(action: { showAbout = true }) {
-                    Label("About", systemImage: "info.circle")
+                    if case .available = updater.status {
+                        Label("Update available", systemImage: "arrow.down.circle.fill")
+                    } else {
+                        Label("About", systemImage: "info.circle")
+                    }
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(updaterHasUpdate ? Color.accentColor : .secondary)
+                .help(updaterHasUpdate ? "A newer version of Final Count is available. Open About to download it." : "About Final Count")
                 .padding(.leading, 6)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
         }
-        // minHeight leaves room for the columns (~560) plus the fixed chrome below
-        // them (status banner + toolbar) so nothing is clipped at the smallest size.
-        .frame(minWidth: 920, minHeight: 700)
+        // minHeight leaves room for the columns (~250: header, a couple of rows, totals)
+        // plus the fixed chrome below them (status banner + toolbar) so nothing is
+        // clipped at the smallest size. Each column's subfolder list scrolls, so the
+        // window can shrink well below the height needed to show every row.
+        .frame(minWidth: 920, minHeight: 420)
         .animation(.easeInOut(duration: 0.2), value: overallStatus)
         // Pointing a column at a different folder invalidates the whole tree.
         .onChange(of: columns.map { $0.url?.path ?? "-" }.joined(separator: "|")) { _, _ in
@@ -200,11 +257,11 @@ struct ContentView: View {
         .onChange(of: columns.map(\.reloadCount).reduce(0, +)) { _, _ in
             childCache.removeAll()
         }
-        .onChange(of: includeHiddenFiles) { _, newValue in
-            store.includeHiddenFiles = newValue
+        .onChange(of: scanSettings) { _, newValue in
+            store.scanSettings = newValue
             refreshAll()
         }
-        .sheet(isPresented: $showAbout) { AboutView() }
+        .sheet(isPresented: $showAbout) { AboutView(updater: updater) }
         .alert("Couldn't Save Report", isPresented: Binding(
             get: { exportError != nil },
             set: { if !$0 { exportError = nil } }
@@ -224,7 +281,8 @@ struct ContentView: View {
             includeHiddenFiles: $includeHiddenFiles
         ))
         .task {
-            store.includeHiddenFiles = includeHiddenFiles
+            updater.checkQuietly(currentVersion: AboutView.appVersion)
+            store.scanSettings = scanSettings
             store.setInitial(count: 2)
         }
         .overlay(alignment: .bottom) {
@@ -285,7 +343,7 @@ struct ContentView: View {
 
         // Snapshot now; locating nested differences re-scans the mismatched
         // branches, which can take a while on a big drive.
-        let input = ReportInput(columns: columns, includeHidden: includeHiddenFiles,
+        let input = ReportInput(columns: columns, settings: scanSettings,
                                 appVersion: AboutView.appVersion)
         isExporting = true
         Task {
@@ -304,6 +362,96 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Ignore Popover
+
+/// Choose names to leave out of the comparison: one-click presets plus custom
+/// names or wildcard patterns. Matches file and folder names only, not paths.
+struct IgnorePopover: View {
+    @Binding var presetIDs: String
+    @Binding var customNames: String
+    @State private var draft = ""
+
+    private var enabledPresets: Set<String> { Set(presetIDs.split(separator: "\n").map(String.init)) }
+    private var customList: [String] { customNames.split(separator: "\n").map(String.init) }
+
+    private func setPreset(_ id: String, on: Bool) {
+        var ids = enabledPresets
+        if on { ids.insert(id) } else { ids.remove(id) }
+        presetIDs = ids.sorted().joined(separator: "\n")
+    }
+
+    private func addDraft() {
+        let name = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !customList.contains(name) else { draft = ""; return }
+        customNames = (customList + [name]).joined(separator: "\n")
+        draft = ""
+    }
+
+    private func remove(_ name: String) {
+        customNames = customList.filter { $0 != name }.joined(separator: "\n")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Ignore when comparing").font(.headline)
+                Text("Files and folders with these names are skipped in every column.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Presets").font(.caption).foregroundStyle(.tertiary)
+                ForEach(IgnorePreset.all) { preset in
+                    Toggle(isOn: Binding(
+                        get: { enabledPresets.contains(preset.id) },
+                        set: { setPreset(preset.id, on: $0) }
+                    )) {
+                        HStack(spacing: 6) {
+                            Text(preset.title)
+                            Text(preset.patterns.joined(separator: ", "))
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Your names").font(.caption).foregroundStyle(.tertiary)
+                if !customList.isEmpty {
+                    ForEach(customList, id: \.self) { name in
+                        HStack {
+                            Text(name).font(.system(.callout, design: .monospaced))
+                            Spacer()
+                            Button { remove(name) } label: {
+                                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Remove \(name)")
+                        }
+                    }
+                }
+                HStack {
+                    TextField("Name or pattern, like *.tmp", text: $draft)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(addDraft)
+                    Button("Add", action: addDraft)
+                        .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+
+            Divider()
+            Text("Off by default. Matching is by name, ignoring case; * and ? work as wildcards. Anything skipped is noted in the status banner and the report.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(width: 340)
+    }
+}
+
 // MARK: - Status Banner
 
 /// The big at-a-glance verdict bar above the toolbar — readable across the room
@@ -314,6 +462,7 @@ struct StatusBanner: View {
     let title: String
     let subtitle: String
     var note: String? = nil
+    var ignoreNote: String? = nil
 
     var body: some View {
         HStack(spacing: 12) {
@@ -331,6 +480,12 @@ struct StatusBanner: View {
                     Label(note, systemImage: "info.circle")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .padding(.top, 2)
+                }
+                if let ignoreNote {
+                    Label(ignoreNote, systemImage: "eye.slash")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                         .padding(.top, 2)
                 }
             }
@@ -788,9 +943,9 @@ struct ExpandableSubfolderRow: View {
                         let url = info.url
                         let key = cacheKey
                         let generation = column.reloadCount
-                        let includeHidden = column.includeHiddenFiles
+                        let settings = column.scanSettings
                         let loaded = await Task.detached(priority: .userInitiated) {
-                            FolderColumn.loadChildren(at: url, includeHidden: includeHidden)
+                            FolderColumn.loadChildren(at: url, settings: settings)
                         }.value
                         // A Refresh while this ran made these children stale.
                         guard generation == column.reloadCount else { return }
@@ -982,7 +1137,8 @@ private struct TypeCountRow: View {
 
 struct AboutView: View {
     @Environment(\.dismiss) private var dismiss
-    @StateObject private var updater = UpdateChecker()
+    @ObservedObject var updater: UpdateChecker
+    @AppStorage(UpdateChecker.checkAtLaunchKey) private var checkAtLaunch = true
 
     private static let repoURL = URL(string: "https://github.com/titleunknown/Final-Count")!
 
@@ -1019,6 +1175,15 @@ struct AboutView: View {
                     .disabled(updater.isChecking)
 
                     updateStatusView
+
+                    Toggle("Check for updates at launch", isOn: $checkAtLaunch)
+                        .toggleStyle(.checkbox)
+                        .controlSize(.small)
+                        .font(.caption)
+                        .help("Quietly look for a newer version when Final Count opens, at most once a day. Nothing is shown unless an update is available.")
+                        .onChange(of: checkAtLaunch) { _, on in
+                            if !on, case .available = updater.status { updater.status = .idle }
+                        }
                 }
                 .padding(.top, 4)
             }
@@ -1046,10 +1211,12 @@ struct AboutView: View {
                         BulletRow("Turn on Only Differences (⇧⌘D) to hide everything that matches.")
                         BulletRow("If two columns point to the same folder on disk — even through an alias or a different path — Final Count warns you instead of calling it a match.")
                         BulletRow("Hidden files (names starting with a dot) are skipped unless you turn on Hidden Files (⇧⌘.).")
+                        BulletRow("Use Ignore to leave files and folders with certain names out of the comparison, such as .DS_Store or a Capture One Cache folder. Pick a preset or add your own names (wildcards like *.tmp work). It's off by default, and anything skipped is noted in the status banner and the report.")
                         BulletRow("A folder marked ⚠︎ couldn't be fully read (a permissions block or a drive error). Its counts are a lower bound, so it's flagged rather than called a match — try Refresh, or check the drive.")
                         BulletRow("Click a folder's path to change it, or right-click to reveal it in Finder.")
                         BulletRow("Export a plain-text report (⌘E) when you're done. It lists every difference down to the exact folder or file that differs.")
-                        BulletRow("Shortcuts: ⌘O add a folder, ⌘R refresh, ⌘E export.")
+                        BulletRow("Turn on File Type Counts to see a breakdown by extension for loose files.")
+                        BulletRow("Shortcuts: ⌘O add a folder, ⌘R refresh, ⌘E export, ⇧⌘D only differences, ⇧⌘. hidden files.")
                     }
                 }
                 .padding(24)
@@ -1129,6 +1296,38 @@ final class UpdateChecker: ObservableObject {
     @Published var isChecking = false
 
     private let apiURL = URL(string: "https://api.github.com/repos/titleunknown/Final-Count/releases/latest")!
+    static let checkAtLaunchKey = "checkForUpdatesAtLaunch"
+    private static let lastCheckKey = "lastUpdateCheck"
+    private static let quietInterval: TimeInterval = 24 * 60 * 60
+
+    /// Launch-time check (user can turn it off in About). Silent by design: at most once a day, no spinner, and
+    /// no error or "up to date" message. It only ever sets `.available`, which the
+    /// toolbar shows as a small accent-colored label.
+    func checkQuietly(currentVersion: String) {
+        let defaults = UserDefaults.standard
+        // On unless the user has turned it off in About.
+        guard defaults.object(forKey: Self.checkAtLaunchKey) as? Bool ?? true else { return }
+        if let last = defaults.object(forKey: Self.lastCheckKey) as? Date,
+           Date().timeIntervalSince(last) < Self.quietInterval { return }
+        Task {
+            guard let result = try? await fetchLatest(), !result.notFound else { return }
+            defaults.set(Date(), forKey: Self.lastCheckKey)
+            if Self.isNewer(result.version, than: currentVersion) {
+                status = .available(version: result.version, url: result.url)
+            }
+        }
+    }
+
+    private func fetchLatest() async throws -> (version: String, url: URL, notFound: Bool) {
+        var req = URLRequest(url: apiURL)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.timeoutInterval = 10
+        let (data, response) = try await URLSession.shared.data(for: req)
+        if let http = response as? HTTPURLResponse, http.statusCode == 404 { return ("", AboutView_repoFallback, true) }
+        let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+        let latest = release.tag_name.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
+        return (latest, URL(string: release.html_url) ?? AboutView_repoFallback, false)
+    }
 
     func check(currentVersion: String) {
         isChecking = true
@@ -1136,18 +1335,14 @@ final class UpdateChecker: ObservableObject {
         Task {
             defer { isChecking = false }
             do {
-                var req = URLRequest(url: apiURL)
-                req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-                let (data, response) = try await URLSession.shared.data(for: req)
-                if let http = response as? HTTPURLResponse, http.statusCode == 404 {
+                let result = try await fetchLatest()
+                if result.notFound {
                     status = .failed("No releases published yet")
                     return
                 }
-                let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
-                let latest = release.tag_name.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
-                let pageURL = URL(string: release.html_url) ?? AboutView_repoFallback
-                if Self.isNewer(latest, than: currentVersion) {
-                    status = .available(version: latest, url: pageURL)
+                UserDefaults.standard.set(Date(), forKey: Self.lastCheckKey)
+                if Self.isNewer(result.version, than: currentVersion) {
+                    status = .available(version: result.version, url: result.url)
                 } else {
                     status = .upToDate
                 }

@@ -14,10 +14,10 @@ import Combine
 class FolderStore: ObservableObject {
     @Published private(set) var columns: [FolderColumn] = []
     private var cancellables: [UUID: AnyCancellable] = [:]
-    /// Scan option shared by every column, so all sides of a comparison are
+    /// Scan options shared by every column, so all sides of a comparison are
     /// always counted the same way.
-    var includeHiddenFiles = false {
-        didSet { columns.forEach { $0.includeHiddenFiles = includeHiddenFiles } }
+    var scanSettings = ScanSettings() {
+        didSet { columns.forEach { $0.scanSettings = scanSettings } }
     }
 
     func setInitial(count: Int) {
@@ -26,7 +26,7 @@ class FolderStore: ObservableObject {
     }
 
     func add(_ col: FolderColumn) {
-        col.includeHiddenFiles = includeHiddenFiles
+        col.scanSettings = scanSettings
         cancellables[col.id] = col.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
@@ -37,6 +37,35 @@ class FolderStore: ObservableObject {
         cancellables[id] = nil
         columns.removeAll { $0.id == id }
     }
+}
+
+/// How a folder is scanned. Applied identically at every depth and to every
+/// column, so both sides of a comparison are always counted the same way.
+struct ScanSettings: Equatable, Sendable {
+    var includeHidden = false
+    /// File and folder names to leave out of the scan. Names only (not paths);
+    /// `*` and `?` wildcards, case-insensitive. Empty means a strict comparison.
+    var ignoreNames: [String] = []
+
+    var hasIgnoreRules: Bool { !ignoreNames.isEmpty }
+
+    func ignores(_ name: String) -> Bool {
+        ignoreNames.contains { fnmatch($0, name, FNM_CASEFOLD) == 0 }
+    }
+}
+
+/// A one-click set of ignore patterns offered in the Ignore popover.
+struct IgnorePreset: Identifiable {
+    let id: String
+    let title: String
+    let patterns: [String]
+
+    static let all: [IgnorePreset] = [
+        IgnorePreset(id: "system", title: "System files",
+                     patterns: [".DS_Store", "._*", "Thumbs.db", "desktop.ini"]),
+        IgnorePreset(id: "captureone", title: "Capture One cache", patterns: ["Cache"]),
+        IgnorePreset(id: "lightroom", title: "Lightroom previews", patterns: ["*.lrdata"]),
+    ]
 }
 
 struct FileTypeCount: Identifiable {
@@ -181,7 +210,10 @@ class FolderColumn: ObservableObject, Identifiable {
     @Published private(set) var reloadCount = 0
     // Published ahead of the scan, so a folder picked twice is flagged at once.
     @Published private(set) var identity: FolderIdentity?
-    var includeHiddenFiles = false
+    var scanSettings = ScanSettings()
+    // Entries skipped by the ignore rules in the last scan (an ignored folder
+    // counts once), so the UI can say how much was left out.
+    @Published var ignoredCount = 0
 
     var name: String { url?.lastPathComponent ?? "" }
     var path: String { url?.path ?? "" }
@@ -196,10 +228,11 @@ class FolderColumn: ObservableObject, Identifiable {
         totalBytes = 0
         loadError = nil
         readErrorCount = 0
+        ignoredCount = 0
         reloadCount += 1
         isLoading = true
         let generation = reloadCount
-        let includeHidden = includeHiddenFiles
+        let settings = scanSettings
 
         Task {
             let id = await Task.detached(priority: .userInitiated) {
@@ -209,7 +242,7 @@ class FolderColumn: ObservableObject, Identifiable {
             self.identity = id
 
             let result = await Task.detached(priority: .userInitiated) {
-                FolderColumn.analyzeDirectory(url: newURL, includeHidden: includeHidden)
+                FolderColumn.analyzeDirectory(url: newURL, settings: settings)
             }.value
             // A newer load (a different folder, or Refresh) started while this
             // scan ran. Its results win; applying these would show one folder's
@@ -219,6 +252,7 @@ class FolderColumn: ObservableObject, Identifiable {
             self.totalFiles = result.totalFiles
             self.totalBytes = result.totalBytes
             self.readErrorCount = result.readErrors
+            self.ignoredCount = result.ignored
             self.loadError = result.error
             self.isLoading = false
         }
@@ -230,8 +264,8 @@ class FolderColumn: ObservableObject, Identifiable {
     }
 
     // Public — used for lazy expansion of nested rows
-    nonisolated static func loadChildren(at url: URL, includeHidden: Bool) -> [SubfolderInfo] {
-        analyzeDirectory(url: url, includeHidden: includeHidden).subfolders
+    nonisolated static func loadChildren(at url: URL, settings: ScanSettings) -> [SubfolderInfo] {
+        analyzeDirectory(url: url, settings: settings).subfolders
     }
 
     nonisolated static func identify(_ url: URL) -> FolderIdentity {
@@ -248,8 +282,8 @@ class FolderColumn: ObservableObject, Identifiable {
         )
     }
 
-    private nonisolated static func scanOptions(includeHidden: Bool) -> FileManager.DirectoryEnumerationOptions {
-        includeHidden ? [] : [.skipsHiddenFiles]
+    private nonisolated static func scanOptions(_ settings: ScanSettings) -> FileManager.DirectoryEnumerationOptions {
+        settings.includeHidden ? [] : [.skipsHiddenFiles]
     }
 
     /// One entry's contribution to its parent's fingerprint. Names are
@@ -269,9 +303,9 @@ class FolderColumn: ObservableObject, Identifiable {
     /// totals are identical whether it's the column root here or a nested row
     /// reached through expansion — the sum of a folder's child rows always
     /// equals its own total, at every level.
-    private nonisolated static func analyzeDirectory(url: URL, includeHidden: Bool) -> (subfolders: [SubfolderInfo], totalFiles: Int, totalBytes: Int64, readErrors: Int, error: String?) {
+    private nonisolated static func analyzeDirectory(url: URL, settings: ScanSettings) -> (subfolders: [SubfolderInfo], totalFiles: Int, totalBytes: Int64, readErrors: Int, ignored: Int, error: String?) {
         let fm = FileManager.default
-        let options = scanOptions(includeHidden: includeHidden)
+        let options = scanOptions(settings)
         let contents: [URL]
         do {
             contents = try fm.contentsOfDirectory(
@@ -280,13 +314,14 @@ class FolderColumn: ObservableObject, Identifiable {
                 options: options
             )
         } catch {
-            return ([], 0, 0, 0, describeAccessError(error))
+            return ([], 0, 0, 0, 0, describeAccessError(error))
         }
 
         var infos: [SubfolderInfo] = []
         var grandTotalFiles = 0
         var grandTotalBytes: Int64 = 0
         var readErrors = 0
+        var ignored = 0
         var looseFiles = 0
         var looseBytes: Int64 = 0
         var looseTypeCounts: [String: (count: Int, bytes: Int64)] = [:]
@@ -297,8 +332,9 @@ class FolderColumn: ObservableObject, Identifiable {
             let values = try? item.resourceValues(forKeys: scanResourceKeySet)
             // Symbolic links are neither followed nor counted — see `walk`.
             if values?.isSymbolicLink == true { continue }
+            if settings.ignores(item.lastPathComponent) { ignored += 1; continue }
             if values?.isDirectory == true {
-                let t = walk(item, fm: fm, options: options)
+                let t = walk(item, fm: fm, settings: settings)
                 infos.append(SubfolderInfo(
                     name: item.lastPathComponent,
                     url: item,
@@ -310,6 +346,7 @@ class FolderColumn: ObservableObject, Identifiable {
                 ))
                 grandTotalFiles += t.files
                 grandTotalBytes += t.bytes
+                ignored += t.ignored
                 if t.readError { readErrors += 1 }
             } else if values?.isRegularFile == true {
                 looseFiles += 1
@@ -342,7 +379,7 @@ class FolderColumn: ObservableObject, Identifiable {
             grandTotalBytes += looseBytes
         }
 
-        return (infos, grandTotalFiles, grandTotalBytes, readErrors, nil)
+        return (infos, grandTotalFiles, grandTotalBytes, readErrors, ignored, nil)
     }
 
     /// Turns a directory-read failure into a message aimed at the likely cause: a
@@ -369,14 +406,17 @@ class FolderColumn: ObservableObject, Identifiable {
     /// Recursively totals a directory subtree. The single traversal policy used
     /// everywhere in the app, applied identically at every depth:
     ///
-    ///  • hidden entries are skipped unless the user opts in (`options`);
+    ///  • hidden entries are skipped unless the user opts in (`settings`);
+    ///  • entries matching the user's ignore names are skipped (and tallied in
+    ///    `ignored`, an ignored folder counting once) — off unless configured;
     ///  • symbolic links are neither followed nor counted — this rules out link
     ///    cycles, keeps out data that lives outside the tree, and makes the total
     ///    independent of which folder the scan started from;
     ///  • a directory that can't be listed contributes whatever was readable and
     ///    sets `readError`, so a scan interrupted by an I/O error on an external
     ///    drive is reported instead of silently passing as a match.
-    private nonisolated static func walk(_ url: URL, fm: FileManager, options: FileManager.DirectoryEnumerationOptions) -> (files: Int, bytes: Int64, immediateSubdirs: Int, fingerprint: UInt64, readError: Bool) {
+    private nonisolated static func walk(_ url: URL, fm: FileManager, settings: ScanSettings) -> (files: Int, bytes: Int64, immediateSubdirs: Int, fingerprint: UInt64, ignored: Int, readError: Bool) {
+        let options = scanOptions(settings)
         let contents: [URL]
         do {
             contents = try fm.contentsOfDirectory(
@@ -385,21 +425,24 @@ class FolderColumn: ObservableObject, Identifiable {
                 options: options
             )
         } catch {
-            return (0, 0, 0, 0, true)
+            return (0, 0, 0, 0, 0, true)
         }
 
         var files = 0
         var bytes: Int64 = 0
         var immediateSubdirs = 0
         var fingerprint: UInt64 = 0
+        var ignored = 0
         var readError = false
 
         for item in contents {
             let values = try? item.resourceValues(forKeys: scanResourceKeySet)
             if values?.isSymbolicLink == true { continue }
+            if settings.ignores(item.lastPathComponent) { ignored += 1; continue }
             if values?.isDirectory == true {
                 immediateSubdirs += 1
-                let sub = walk(item, fm: fm, options: options)
+                let sub = walk(item, fm: fm, settings: settings)
+                ignored += sub.ignored
                 files += sub.files
                 bytes += sub.bytes
                 fingerprint &+= entryHash(item.lastPathComponent, isDirectory: true, sub.fingerprint)
@@ -411,7 +454,7 @@ class FolderColumn: ObservableObject, Identifiable {
                 fingerprint &+= entryHash(item.lastPathComponent, isDirectory: false, UInt64(bitPattern: size))
             }
         }
-        return (files, bytes, immediateSubdirs, fingerprint, readError)
+        return (files, bytes, immediateSubdirs, fingerprint, ignored, readError)
     }
 }
 
@@ -574,7 +617,7 @@ struct FolderDifference {
 /// actually differ. Only mismatched branches are re-scanned, and a mismatch is
 /// reported at its own level when none of its children explain it.
 func findDifferences(roots: [URL], children: [[SubfolderInfo]], relPath: String,
-                                 includeHidden: Bool, into out: inout [FolderDifference]) {
+                                 settings: ScanSettings, into out: inout [FolderDifference]) {
     var seen = Set<String>()
     var names: [String] = []
     for list in children {
@@ -592,9 +635,9 @@ func findDifferences(roots: [URL], children: [[SubfolderInfo]], relPath: String,
         // names the exact files that differ.
         if !isLoose, found.count == roots.count {
             let before = out.count
-            let grandchildren = found.map { FolderColumn.loadChildren(at: $0.url, includeHidden: includeHidden) }
+            let grandchildren = found.map { FolderColumn.loadChildren(at: $0.url, settings: settings) }
             findDifferences(roots: roots, children: grandchildren, relPath: childPath,
-                            includeHidden: includeHidden, into: &out)
+                            settings: settings, into: &out)
             if out.count > before { continue }
         }
 
@@ -631,20 +674,21 @@ struct ReportInput {
         let readErrorCount: Int
         let loadError: String?
         let identity: FolderIdentity?
+        let ignoredCount: Int
     }
     let columns: [Column]
     let state: ComparisonState
-    let includeHidden: Bool
+    let settings: ScanSettings
     let appVersion: String
 
-    @MainActor init(columns: [FolderColumn], includeHidden: Bool, appVersion: String) {
+    @MainActor init(columns: [FolderColumn], settings: ScanSettings, appVersion: String) {
         self.columns = columns.map {
             Column(name: $0.name, url: $0.url, subfolders: $0.subfolders, totalFiles: $0.totalFiles,
                    totalBytes: $0.totalBytes, readErrorCount: $0.readErrorCount,
-                   loadError: $0.loadError, identity: $0.identity)
+                   loadError: $0.loadError, identity: $0.identity, ignoredCount: $0.ignoredCount)
         }
         self.state = comparisonState(for: columns)
-        self.includeHidden = includeHidden
+        self.settings = settings
         self.appVersion = appVersion
     }
 }
@@ -655,7 +699,11 @@ func buildReport(_ input: ReportInput) -> String {
     lines.append("Final Count — Folder Comparison Report")
     lines.append("Generated: \(Date().formatted(date: .abbreviated, time: .standard))  ·  Final Count \(input.appVersion)")
     lines.append("Compared: file names, folder layout, file counts, and sizes. File contents are not checksummed.")
-    lines.append("Hidden files: \(input.includeHidden ? "included" : "excluded")")
+    lines.append("Hidden files: \(input.settings.includeHidden ? "included" : "excluded")")
+    if input.settings.hasIgnoreRules {
+        lines.append("Ignored names: " + input.settings.ignoreNames.joined(separator: ", ")
+                     + "  (matching files and folders were left out of every column)")
+    }
     lines.append(String(repeating: "─", count: 80))
 
     for (i, col) in columns.enumerated() {
@@ -678,6 +726,9 @@ func buildReport(_ input: ReportInput) -> String {
         let totalLabel = "TOTAL (\(col.subfolders.filter { !$0.isLooseFilesRow }.count) folders)"
         let totalSize = ByteCountFormatter.string(fromByteCount: col.totalBytes, countStyle: .file)
         lines.append("  " + rpad(totalLabel, 32) + " " + lpad("—", 8) + "  " + lpad(col.totalFiles.formatted(), 8) + "  " + lpad(totalSize, 12))
+        if input.settings.hasIgnoreRules {
+            lines.append("  Ignored: \(col.ignoredCount.formatted()) matching item\(col.ignoredCount == 1 ? "" : "s") left out")
+        }
     }
 
     lines.append("")
@@ -693,11 +744,13 @@ func buildReport(_ input: ReportInput) -> String {
         }
         lines.append("  A folder can't verify itself. Choose the other copy (e.g. the backup drive) and export again.")
     case .identical:
-        lines.append("✓ All folders are identical.")
+        lines.append(input.settings.hasIgnoreRules
+                     ? "✓ All folders are identical, apart from the ignored names listed above."
+                     : "✓ All folders are identical.")
     case .differences:
         var diffs: [FolderDifference] = []
         findDifferences(roots: columns.compactMap(\.url), children: columns.map(\.subfolders),
-                        relPath: "", includeHidden: input.includeHidden, into: &diffs)
+                        relPath: "", settings: input.settings, into: &diffs)
         lines.append("✗ Differences found (\(diffs.count)):")
         for d in diffs {
             lines.append("")
