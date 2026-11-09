@@ -559,15 +559,16 @@ struct ColumnView: View {
             }
             Divider()
 
-            if column.isLoading {
+            switch column.phase {
+            case .scanning:
                 Spacer()
                 ProgressView().padding()
                 Spacer()
-            } else if column.url == nil {
+            case .empty:
                 dropPrompt
-            } else if let error = column.loadError {
+            case .failed(let error):
                 accessErrorPrompt(error)
-            } else {
+            case .loaded:
                 subfolderList
                 Divider()
                 totalsRow
@@ -738,9 +739,8 @@ struct ColumnView: View {
                         name: sub.name,
                         info: sub,
                         depth: 0,
-                        status: statusFor(name: sub.name, in: allColumns),
-                        statusDetail: statusDetail(name: sub.name, in: allColumns),
-                        showStatus: canShowStatus,
+                        status: canShowStatus ? statusFor(name: sub.name, in: allColumns) : nil,
+                        statusDetail: canShowStatus ? statusDetail(name: sub.name, in: allColumns) : nil,
                         subW: subW, fileW: fileW, sizeW: sizeW,
                         expandedRelPaths: $expandedRelPaths,
                         childCache: $childCache,
@@ -754,11 +754,7 @@ struct ColumnView: View {
         }
     }
 
-    // Comparing against a column that is still scanning (url set, subfolders not
-    // yet populated) would flag every row as missing.
-    private var canShowStatus: Bool {
-        allColumns.count > 1 && allColumns.allSatisfy({ $0.url != nil && !$0.isLoading })
-    }
+    private var canShowStatus: Bool { rowsAreComparable(allColumns) }
 
     private var visibleSubfolders: [SubfolderInfo] {
         guard showOnlyDifferences && canShowStatus else { return column.subfolders }
@@ -838,9 +834,9 @@ struct ExpandableSubfolderRow: View {
     let name: String
     let info: SubfolderInfo?
     let depth: Int
-    let status: MatchStatus
+    /// This row's verdict across columns; `nil` = not known yet, so no flag is shown.
+    let status: MatchStatus?
     var statusDetail: String? = nil
-    let showStatus: Bool
     let subW: CGFloat
     let fileW: CGFloat
     let sizeW: CGFloat
@@ -850,21 +846,31 @@ struct ExpandableSubfolderRow: View {
     var showOnlyDifferences: Bool = false
     @Binding var expandedTypeIDs: Set<UUID>
 
-    private var isExpanded: Bool { expandedRelPaths.contains(relPath) }
+    /// Identity of this folder for expansion and child-cache lookups. Each column
+    /// spells `relPath` with its own folder names, but folders are matched across
+    /// columns by `canonicalFolderName`; keying by the canonical path keeps
+    /// "Capture" and "capture " expanding together and finding each other's cache.
+    private var treeKey: String {
+        relPath.split(separator: "/", omittingEmptySubsequences: false)
+            .map { canonicalFolderName(String($0)) }
+            .joined(separator: "/")
+    }
+
+    private var isExpanded: Bool { expandedRelPaths.contains(treeKey) }
     private var canExpand: Bool { (info?.subfolderCount ?? 0) > 0 }
-    private var cacheKey: ChildCacheKey { ChildCacheKey(column: column.id, relPath: relPath) }
+    private var cacheKey: ChildCacheKey { ChildCacheKey(column: column.id, relPath: treeKey) }
     private var loadedChildren: [SubfolderInfo]? { childCache[cacheKey] }
 
     /// Compares one child against the same child in every column, once all
     /// columns have scanned this folder. `nil` = not enough data yet, so the
     /// child row shows no verdict rather than a wrong one.
     @MainActor private func nestedStatus(_ child: SubfolderInfo) -> MatchStatus? {
-        guard allColumns.count > 1,
-              allColumns.allSatisfy({ $0.url != nil && !$0.isLoading }) else { return nil }
+        guard rowsAreComparable(allColumns) else { return nil }
         let key = canonicalFolderName(child.name)
+        let folderKey = treeKey
         var entries: [SubfolderInfo?] = []
         for col in allColumns {
-            guard let kids = childCache[ChildCacheKey(column: col.id, relPath: relPath)] else { return nil }
+            guard let kids = childCache[ChildCacheKey(column: col.id, relPath: folderKey)] else { return nil }
             entries.append(kids.first(where: { canonicalFolderName($0.name) == key }))
         }
         return compareEntries(entries, columnCount: allColumns.count)
@@ -872,8 +878,9 @@ struct ExpandableSubfolderRow: View {
 
     @MainActor private func nestedDetail(_ child: SubfolderInfo) -> String? {
         let key = canonicalFolderName(child.name)
+        let folderKey = treeKey
         let entries = allColumns.map { col -> (path: String, info: SubfolderInfo?) in
-            let kids = childCache[ChildCacheKey(column: col.id, relPath: relPath)]
+            let kids = childCache[ChildCacheKey(column: col.id, relPath: folderKey)]
             return ("\(col.path)/\(relPath)", kids?.first(where: { canonicalFolderName($0.name) == key }))
         }
         return compareDetail(entries, columnCount: allColumns.count)
@@ -918,9 +925,8 @@ struct ExpandableSubfolderRow: View {
                             name: child.name,
                             info: child,
                             depth: depth + 1,
-                            status: st ?? .match,
+                            status: st,
                             statusDetail: st != nil ? nestedDetail(child) : nil,
-                            showStatus: st != nil,
                             subW: subW, fileW: fileW, sizeW: sizeW,
                             expandedRelPaths: $expandedRelPaths,
                             childCache: $childCache,
@@ -959,11 +965,10 @@ struct ExpandableSubfolderRow: View {
     private var indentWidth: CGFloat { CGFloat(depth) * 18 }
 
     private var rowBackground: Color {
-        guard showStatus else { return .clear }
         switch status {
-        case .match: return .clear
         case .mismatch: return Color.orange.opacity(0.12)
         case .missing: return Color.red.opacity(0.10)
+        case .match, nil: return .clear
         }
     }
 
@@ -977,22 +982,18 @@ struct ExpandableSubfolderRow: View {
             // Status indicator — shown at every depth so a flagged folder can be
             // opened to find exactly which nested folder differs.
             Group {
-                if showStatus {
-                    switch status {
-                    case .match:
-                        Spacer().frame(width: 20)
-                    case .mismatch:
-                        Image(systemName: "exclamationmark.circle.fill")
-                            .font(.caption2).foregroundStyle(.orange)
-                            .frame(width: 20)
-                            .help(statusDetail ?? "Contents differ between columns")
-                    case .missing:
-                        Image(systemName: "minus.circle.fill")
-                            .font(.caption2).foregroundStyle(.red)
-                            .frame(width: 20)
-                            .help(statusDetail ?? "Folder not found in every column")
-                    }
-                } else {
+                switch status {
+                case .mismatch:
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.caption2).foregroundStyle(.orange)
+                        .frame(width: 20)
+                        .help(statusDetail ?? "Contents differ between columns")
+                case .missing:
+                    Image(systemName: "minus.circle.fill")
+                        .font(.caption2).foregroundStyle(.red)
+                        .frame(width: 20)
+                        .help(statusDetail ?? "Folder not found in every column")
+                case .match, nil:
                     Spacer().frame(width: 20)
                 }
             }
@@ -1053,12 +1054,12 @@ struct ExpandableSubfolderRow: View {
                     }
                 }
                 .font(.callout).monospacedDigit()
-                .foregroundStyle(showStatus && status == .mismatch ? Color.orange : Color.primary)
+                .foregroundStyle(status == .mismatch ? Color.orange : Color.primary)
                 .frame(width: fileW, alignment: .trailing)
                 // Size
                 Text(info.formattedSize)
                     .font(.callout).monospacedDigit()
-                    .foregroundStyle(showStatus && status == .mismatch ? Color.orange : Color.primary)
+                    .foregroundStyle(status == .mismatch ? Color.orange : Color.primary)
                     .frame(width: sizeW, alignment: .trailing)
             } else {
                 Text("—")
@@ -1074,9 +1075,9 @@ struct ExpandableSubfolderRow: View {
 
     private func toggleExpand() {
         if isExpanded {
-            expandedRelPaths.remove(relPath)
+            expandedRelPaths.remove(treeKey)
         } else {
-            expandedRelPaths.insert(relPath)
+            expandedRelPaths.insert(treeKey)
         }
     }
 

@@ -191,6 +191,15 @@ func isFolder(_ url: URL) -> Bool {
     (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
 }
 
+/// A column's lifecycle. `isLoading` implies a folder is chosen, so the cases
+/// are mutually exclusive: no folder yet → scanning → readable or failed.
+enum ScanPhase: Equatable {
+    case empty
+    case scanning
+    case loaded
+    case failed(String)
+}
+
 @MainActor
 class FolderColumn: ObservableObject, Identifiable {
     let id = UUID()
@@ -217,6 +226,16 @@ class FolderColumn: ObservableObject, Identifiable {
 
     var name: String { url?.lastPathComponent ?? "" }
     var path: String { url?.path ?? "" }
+
+    /// Where this column is in its life, derived from the fields above so the
+    /// view and the verdict switch on one value instead of re-testing
+    /// `isLoading`, `url` and `loadError` in their own order.
+    var phase: ScanPhase {
+        if isLoading { return .scanning }
+        guard url != nil else { return .empty }
+        if let loadError { return .failed(loadError) }
+        return .loaded
+    }
 
     func load(from pickedURL: URL) {
         // Scan the real folder behind a symlink; listing the link itself fails.
@@ -464,8 +483,9 @@ enum MatchStatus { case match, mismatch, missing }
 
 /// Identifies one folder's scanned children in the shared expansion cache: which
 /// column, and the folder's path relative to that column's root (e.g.
-/// "Capture/LOOK_7185"). The relative path lets the same nested folder be matched
-/// across columns the way top-level rows are matched by name.
+/// "capture/look_7185", canonicalized per component). The relative path lets the
+/// same nested folder be matched across columns the way top-level rows are
+/// matched by name.
 struct ChildCacheKey: Hashable {
     let column: UUID
     let relPath: String
@@ -589,16 +609,23 @@ enum ComparisonState: Equatable {
     case differences(Int)
 }
 
+/// Whether per-row match/missing flags may be shown yet. Comparing against a
+/// column that has no folder or is still scanning would flag every row as
+/// missing. The single gate for top-level and nested rows alike.
+@MainActor func rowsAreComparable(_ columns: [FolderColumn]) -> Bool {
+    columns.count > 1 && columns.allSatisfy { $0.url != nil && !$0.isLoading }
+}
+
 @MainActor func comparisonState(for columns: [FolderColumn]) -> ComparisonState {
     guard columns.count > 1 else { return .notReady("Add at least two folders to compare.") }
     // Checked before scanning finishes: no scan result can make this valid.
     let duplicates = duplicateFolderGroups(columns.map(\.identity))
     if !duplicates.isEmpty { return .sameFolder(duplicates) }
-    if let i = columns.firstIndex(where: { $0.url == nil }) {
+    if let i = columns.firstIndex(where: { $0.phase == .empty }) {
         return .notReady("No folder has been chosen for column \(i + 1).")
     }
-    if columns.contains(where: \.isLoading) { return .notReady("Folders are still being scanned.") }
-    if let i = columns.firstIndex(where: { $0.loadError != nil }) {
+    if columns.contains(where: { $0.phase == .scanning }) { return .notReady("Folders are still being scanned.") }
+    if let i = columns.firstIndex(where: { if case .failed = $0.phase { return true } else { return false } }) {
         return .notReady("Column \(i + 1) couldn't be read.")
     }
     let mismatchCount = allSubfolderNames(in: columns)
